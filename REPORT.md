@@ -332,7 +332,54 @@ scored 15/20 and 16/20 with them present.
 
 ---
 
-## 8. An upstream TLS bug found on the way
+## 8. Why some press angles fail
+
+Symptom: some angles never authenticate. Measured on six presses of the same
+enrolled finger, varying the angle deliberately:
+
+| press | score (threshold 20) | |
+|---|---|---|
+| 1 | 44 | match |
+| 2 | 56 | match |
+| 3 | 25 | match |
+| 4 | **0** | fail |
+| 5 | 31 | match |
+| 6 | **5** | fail |
+
+The distribution is **bimodal** — 25-56 or 0-5, never 18-19. A coverage
+problem in the template would produce near-misses just under the threshold, so
+this is not that. The template carries 20 views and is fine.
+
+The captures themselves explain it. Both pass and fail produce a valid
+22189-byte frame in normal time, but:
+
+| capture | score | active pixels | diff mean |
+|---|---|---|---|
+| pass | 37 | 14292 | 918 |
+| pass | 23 | 13362 | 888 |
+| fail | 3 | 5172 | 349 |
+| fail | 7 | 5062 | 334 |
+
+A failing press puts roughly **a third** of the finger on the sensor. The
+matcher is working correctly; there is less to match.
+
+Rotation was the obvious suspect and was tested directly, not assumed: rotating
+a failing capture through +-30 degrees and re-scoring changes nothing — the best
+angle is always 0 deg.
+
+| pair | direct | best over +-30 deg |
+|---|---|---|
+| weak vs strong | 4 | 4 (at 0 deg) |
+| weak vs strong | 19 | 19 (at 0 deg) |
+| strong vs itself | 137 | 137 (at 0 deg) |
+
+So the descriptors are genuinely rotation-invariant, and the loss is **signal
+coverage**, not pose. The fix is pressing with the pad centred on the button;
+there is no code change that recovers a third of a fingerprint.
+
+---
+
+## 9. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -361,7 +408,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 9. Verification
+## 10. Verification
 
 Repeated, measured, on the final build:
 
@@ -388,7 +435,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 10. Remaining work
+## 11. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -411,7 +458,7 @@ password always remains available as a fallback.
 
 ---
 
-## 11. Security notes
+## 12. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -427,7 +474,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 12. Provenance
+## 13. Provenance
 
 Reverse-engineering input, all public:
 

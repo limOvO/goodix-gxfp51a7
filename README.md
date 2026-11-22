@@ -158,6 +158,29 @@ rather than assumed: `SPI_CS_HIGH` (this unit runs plain `SPI_MODE_0`) and the
 A 0xD0 reply means the sensor wants a fresh TLS session; the driver reconnects
 and retries once instead of failing.
 
+## Why some press angles fail
+
+Measured on six presses of one enrolled finger, deliberately varying the angle:
+
+```
+44  56  25  0  31  5        (threshold 20)
+```
+
+Bimodal — 25-56 or 0-5, never a near miss. That is not template coverage. The
+captures say it plainly:
+
+| result | active pixels | finger signal |
+|---|---|---|
+| matches (37, 23) | 13362-14292 | full press |
+| fails (3, 7) | 5062-5172 | **a third of the finger** |
+
+Rotation was tested rather than assumed: rotating a failing capture through
++-30 deg and re-scoring changes nothing (best angle always 0 deg, 4 -> 4,
+19 -> 19), so the descriptors are already rotation-invariant.
+
+A failing press is not centred on the pad. There is no code fix for a third of
+a fingerprint — press with the pad under the centre of the fingertip.
+
 ## If recognition gets worse after a driver change
 
 Clear the on-disk state produced while it was broken — it drags scores down
