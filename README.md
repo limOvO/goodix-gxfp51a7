@@ -125,27 +125,51 @@ that path behaves differently from the background path.
 
 ## The capture recipe
 
-The most important detail, from the
-[GXFP51A0 protocol reference](https://github.com/szlukabence/goodix-fingerprint-spi-linux):
+Two published recipes exist for this family and they disagree about the finger
+path. Both were tested here; only one works.
 
-> **`fdt_down` must be (re)armed before every frame.** Arming once yields one
-> usable frame and then stale or empty ones.
-
-So capture is two explicit phases, each arming for its own frame:
+The short recipe — used for a background frame — also captures a **pressed
+finger** correctly on this 132x112 panel:
 
 ```
-background:  mcu_state ; fdt_mode(boot) ; nav ; fdt_mode(background) ; get_image
-finger:      fdt_mode(finger) ; fdt_down(finger)
-             nop ; mcu_state
-             fdt_down(capture) ; get_image
+mcu_state(0x55) ; fdt_mode(0d01, boot) ; nav ; fdt_mode(0d01, background) ; get_image
 ```
+
+The [GXFP51A0 reference](https://github.com/szlukabence/goodix-fingerprint-spi-linux)'s
+finger-specific re-arm sequence (`fdt_mode(finger) ; fdt_down(finger) ; nop ;
+mcu_state ; fdt_down(capture)`) produces **no image at all** here — the
+sequence completes, `0x20` returns nothing, and every press is rejected. It
+belongs to that board's 88x80 panel.
+
+Measured on one build, finger on the sensor:
+
+| finger recipe | result |
+|---|---|
+| reference re-arm sequence | 0 usable frames |
+| short recipe | **49, 45 matches** (threshold 20) |
+
+Confirmed from a fully clean state: **27 matches against a threshold of 18 —
+MATCH**.
+
+Two other findings from that reference do not apply here and were checked
+rather than assumed: `SPI_CS_HIGH` (this unit runs plain `SPI_MODE_0`) and the
+88x80 / 64-column geometry (this unit is 132x112).
 
 A 0xD0 reply means the sensor wants a fresh TLS session; the driver reconnects
 and retries once instead of failing.
 
-Two findings from that reference do **not** apply here, and were checked rather
-than assumed: `SPI_CS_HIGH` (needed on the 51A0 board, not on this one) and the
-88x80 / 64-column geometry (this unit is 132x112).
+## If recognition gets worse after a driver change
+
+Clear the on-disk state produced while it was broken — it drags scores down
+independently of the code:
+
+```bash
+sudo rm -rf /var/lib/fprint/.goodixtls-adapt/* \
+            /var/lib/fprint/.goodixtls-bg \
+            /var/lib/fprint/.goodixtls-timing
+```
+
+A template enrolled with a bad build must also be re-enrolled.
 
 ## Build
 

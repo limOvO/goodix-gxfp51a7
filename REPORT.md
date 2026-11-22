@@ -31,11 +31,15 @@ them required reading the sensor's own protocol off the bus.
 | Finger detection | idle mean 356 → floor 332, drop 98–125 on press |
 | Image capture | 22189-byte frame on every attempt |
 | Enrolment progress | **12 consecutive stages**, keypoints 143 → 854, extent 107×87 → 253×227 |
-| Match scores | 24-28 against a threshold of 20 (fresh background, working build) |
+| Match scores | **27 against a threshold of 18 (MATCH)**, clean state |
 
-**What is not yet confirmed:** a completed 20-stage enrolment and a matching
-verify. Both need ~20 physical presses, which cannot be automated. The capture
-path is proven; the end-to-end enrolment is a manual step (see §10).
+**Confirmed with a finger on the sensor:** verification now scores
+27 matches against a threshold of 18, reporting MATCH, from a clean state. Two
+earlier runs scored 15 and 16 only because of polluted on-disk state (§7), not
+because of the code.
+
+**What is not yet confirmed:** a fresh 20-stage enrolment end to end, and login
+unlock. Both need ~20 physical presses, which cannot be automated (§10).
 
 ---
 
@@ -218,7 +222,7 @@ pristine clone and reproduce the working source byte-for-byte.
 | Firmware detect | retry; unreadable ⇒ assume 14115 if a key is cached |
 | Cleanup | removed (the reference teardown broke the next frame) |
 | Speed | attempted, reverted (see §6) |
-| Capture recipe | two phases, fdt_down re-armed before every frame (see §7) |
+| Capture recipe | short recipe for both frames; reference re-arm does not work here (§7) |
 | 0xD0 handling | reconnect the TLS session and retry once |
 | TLS (`goodix_tls.c`) | validate all CBC padding bytes, not just the last |
 
@@ -260,49 +264,71 @@ from the background path.
 
 ---
 
-## 7. The capture recipe, per the GXFP51A0 reference
+## 7. The capture recipe — and what actually captures a finger
 
-A later, more detailed source —
-[szlukabence/goodix-fingerprint-spi-linux](https://github.com/szlukabence/goodix-fingerprint-spi-linux)
-— documents the capture sequence for this sensor family, and it corrected one
-thing this driver had wrong.
+Two references for this sensor family exist and they disagree about the finger
+path. Both were tested on this unit; only one works.
 
-Its key warning:
-
-> **`fdt_down` must be (re)armed before every frame.** Arming once per burst
-> yields one usable frame and then stale/empty ones.
-
-An earlier simplification here had collapsed the finger path into the background
-path, removing that arming step — which is exactly the "one good frame, then
-nothing" pattern the failures showed. The recipe is now two explicit phases:
+**The short recipe** (what this driver uses for a background frame):
 
 ```
-background:  mcu_state ; fdt_mode(boot) ; nav ; fdt_mode(background) ; get_image
-finger:      fdt_mode(finger) ; fdt_down(finger)
-             nop ; mcu_state
-             fdt_down(capture: 80b2 80c2 80a7 80b6 80a6 80b6)
-             get_image
+mcu_state(0x55) ; fdt_mode(0d01, boot zones) ; nav ; fdt_mode(0d01, background zones) ; get_image
 ```
 
-All four zone blocks were verified byte-for-byte against the reference
-(`b2b2 c2c2 a7a7 b6b6 a6a6 b6b6`, `80b0 …`, `80b1 …`, `80b2 80c2 80a7 80b6 80a6 80b6`).
+**The finger-specific re-arm recipe** from
+[szlukabence/goodix-fingerprint-spi-linux](https://github.com/szlukabence/goodix-fingerprint-spi-linux),
+whose docs stress that `fdt_down` must be re-armed before every frame:
 
-Two of its other findings do **not** apply here, and were checked rather than
-assumed:
+```
+fdt_mode(0d01, finger) ; fdt_down(0c01, finger)
+nop ; mcu_state(0x55)
+fdt_down(0c01, 80b2 80c2 80a7 80b6 80a6 80b6)
+get_image
+```
 
-- **`SPI_CS_HIGH`** is required on the 51A0 board. It is not needed on this one:
-  our driver has always run `SPI_MODE_0` without it and reads the firmware
-  version reliably.
-- **88x80 geometry with a 64-column active area** is that panel. This unit
-  returns 22189-byte records = 132x112 (14784 px), the larger sibling, and the
-  decode matches exactly.
+**Measured here, the second one produces no image at all.** The sequence
+completes, `0x20` returns no record, and every press is rejected as "swipe too
+short" — the sensor answers with nothing rather than with a bad frame. That
+recipe belongs to the 88x80 GXFP51A0 panel; this unit is 132x112.
+
+The short recipe captures a pressed finger correctly on this panel. Compared on
+one build, finger on the sensor:
+
+| finger recipe | result |
+|---|---|
+| reference re-arm sequence | **0 usable frames**, every press rejected |
+| short recipe (same as background) | **49, 45 matches** against a threshold of 20 |
+
+So on this part a finger frame and a background frame are the *same* exchange.
+The final confirmation run, with all polluted state cleared, scored
+**27 matches against a threshold of 18 — MATCH**.
+
+Two other findings in that reference do **not** apply here either, and were
+checked rather than assumed:
+
+- **`SPI_CS_HIGH`** is required on the 51A0 board. Not here: this driver runs
+  plain `SPI_MODE_0` and reads the firmware version reliably.
+- **88x80 geometry with 64 active columns** is that panel. This unit returns
+  22189-byte records = 132x112 (14784 px), and the decode matches exactly.
 
 Also implemented from the protocol docs: a **0xD0 reply now triggers a session
-reconnect and one retry** instead of failing. The sensor uses 0xD0 to ask for a
-fresh TLS session after its state fails to advance; the vendor driver restarts
-its init thread on it, and this driver previously only logged a warning. The
-drain now aborts immediately on 0xD0 so the remaining commands are not sent into
-a dead session.
+reconnect and one retry** instead of failing. The sensor asks for a fresh TLS
+session when its state does not advance — the vendor driver restarts its init
+thread on it — and this driver previously only logged a warning.
+
+### State pollution matters as much as the code
+
+Three separate pieces of on-disk state were produced during the broken period
+and each dragged the score down afterwards:
+
+| state | effect |
+|---|---|
+| finger-2 template (enrolled 03:05, bad recipe) | a second, unusable print |
+| `.goodixtls-adapt/*.views` | 3 views captured with no usable frame, fused into every verify |
+| `.goodixtls-bg` | a background frame taken with a finger resting on the sensor |
+
+After clearing all three, the same finger scored 27/18 (MATCH) where it had
+scored 15/20 and 16/20 with them present.
 
 ---
 
