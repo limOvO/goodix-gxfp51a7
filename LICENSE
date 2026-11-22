@@ -1,0 +1,13 @@
+# Licence
+
+The driver code in this repository is derived from
+[Sigfrodr/libfprint-goodixtls](https://github.com/Sigfrodr/libfprint-goodixtls)
+and remains **LGPL-2.1-or-later**. The full text is in [`COPYING`](COPYING).
+
+That covers the patches and any source here that builds on the driver. The
+upstream libfprint TOD fork (fetched by `bootstrap.sh`) carries its own
+LGPL-2.1-or-later licence, and the build scripts, documentation and diagnostic
+tools in this repository are offered under the same terms for simplicity.
+
+This project contains no vendor binaries, no firmware images and no captured
+biometric data.
