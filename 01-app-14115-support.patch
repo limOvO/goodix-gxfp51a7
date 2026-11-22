@@ -1,0 +1,896 @@
+diff --git a/goodixtls.c b/goodixtls.c
+index 8b41bcb..7b21896 100644
+--- a/goodixtls.c
++++ b/goodixtls.c
+@@ -43,6 +43,7 @@
+ #include <sys/ioctl.h>
+ #include <linux/spi/spidev.h>
+ #include <linux/gpio.h>
++#include <openssl/evp.h>
+ 
+ #include "goodixtls.h"
+ #include "goodix_sift.h"
+@@ -90,10 +91,12 @@ struct _FpiDeviceGoodixTls
+ 
+   const GxModel *model;      /* never NULL once opened */
+   gboolean       tls_reconn; /* the MCU sent 0xD0 (reconnect) during a drain */
++  gboolean       fw_14115;   /* GF_ST411SEC_APP_14115: factory PMK + FDT recipe */
+   guint16        fdt_meas[12]; /* MilanL: last measured FDT up base */
+   gboolean       fdt_meas_ok;
+ 
+   int            spi_fd;
++  gchar         *spi_path;    /* node path, so the transport can be reopened */
+   FpiSsm        *task_ssm;
+ 
+   /* TLS stack. Note the sensor is the client and we are the server. */
+@@ -101,6 +104,7 @@ struct _FpiDeviceGoodixTls
+   gboolean tls_up;
+ 
+   guint8   psk[GOODIX_PSK_LEN];
++  gboolean psk_from_cache;   /* psk came from the cache, not a live derivation */
+ 
+   /* Reassembly buffer for TLS records, drained by the BIO recv callback. */
+   guint8     tls_rx[GOODIX_RX_MAX];
+@@ -257,19 +261,21 @@ static void
+ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+ {
+ /* Empty reads, 10 ms apart, that count as silence after a response. This is
+- * the dominant cost of a capture: each of the nine commands in the sequence
+- * pays it. Cut it too short and frame boundaries desynchronise, leaving the
+- * sensor wedged in a state only a hard reset plus an spidev rebind recovers.
++ * the dominant cost of a capture: each command in the sequence pays it. Cut it
++ * too short and frame boundaries desynchronise, leaving the sensor wedged in a
++ * state only a hard reset plus a spidev rebind recovers.
+  *
+- * Measured over 6 to 8 captures per setting:
+- *   6 -> 1319 ms, no failures       (original value)
+- *   4 -> 1136 ms, no failures       <- kept
+- *   3 -> 1062 ms, no failures
+- *   2 -> total failure, sensor wedged
+- * We keep 4 rather than 3: shipping the value right next to the cliff would
+- * leave no margin for load or temperature variation. */
++ * Re-measured on this unit (5-6 captures per point, firmware 14115) after the
++ * capture recipe was corrected, because the earlier table below was taken with
++ * the wrong recipe and a 150% timing scale, which inflated every figure:
++ *
++ *   4 -> 724 ms average, 6/6 ok
++ *   3 -> 615 ms average, 6/6 ok       <- kept (with a 25 ms sequence gap)
++ *   2 -> 0/6 ok, no image at all
++ *
++ * 2 is a hard cliff, not a slow degradation, so 3 is the usable floor. */
+ #ifndef GX_DRAIN_SILENCE
+-#define GX_DRAIN_SILENCE 4
++#define GX_DRAIN_SILENCE 3
+ #endif
+ 
+   static guint8 scratch[GOODIX_RX_MAX];
+@@ -416,11 +422,30 @@ gx_tls_cmd (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *data, int dl)
+ /*  Arbitrary memory read: this is how the pre-shared key is obtained  */
+ /* ------------------------------------------------------------------ */
+ 
++/* Memory-read reply layouts, as measured on the two firmware generations.
++ *
++ * Older firmware (11033/14003) answers with the data straight after the
++ * command byte:  cmd(1) + len16(2) + data + cksum(1).
++ *
++ * Firmware 14115 (MateBook 13 WRT-WX9, this unit) prepends an echo of the
++ * request — the 4-byte address, the 4-byte length and the request checksum —
++ * and counts that overhead inside the requested length:
++ *
++ *   cmd(1) + len16(2) + addr_echo(4) + len_echo(4) + req_cksum(1)
++ *   + data(N-9) + reply_cksum(1)
++ *
++ * so asking for N bytes yields only N-9 of data, and reading it from offset 3
++ * hands the TLS layer the echo instead of the key — which fails the handshake
++ * with "cipher operation failed", the same symptom as a wrong PSK address.
++ * The echo is detected rather than assumed, so one binary serves both. */
++#define GX_MEM_ECHO_OVERHEAD 9   /* addr + len + request checksum */
++
+ static int
+ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+ {
+   guint8 pkt[12], ty;
+   guint32 a = mem - 0x08000000;
++  guint32 req = len + GX_MEM_ECHO_OVERHEAD;
+   int n, hdr;
+ 
+   pkt[0] = GOODIX_CMD_MEM_READ;
+@@ -430,10 +455,10 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+   pkt[4] = a >> 8;
+   pkt[5] = a >> 16;
+   pkt[6] = a >> 24;
+-  pkt[7] = len;
+-  pkt[8] = len >> 8;
+-  pkt[9] = len >> 16;
+-  pkt[10] = len >> 24;
++  pkt[7] = req;
++  pkt[8] = req >> 8;
++  pkt[9] = req >> 16;
++  pkt[10] = req >> 24;
+   pkt[11] = goodix_body_cksum (pkt, 11);
+ 
+   if (!gx_send_plain_raw (self, pkt, sizeof pkt))
+@@ -446,8 +471,23 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+     n = gx_read_frame (self, &ty, rx, sizeof rx);
+     if (n <= 0)
+       return -1;
+-    hdr = (rx[0] >> 4) == 0xF ? 3 : 0;          /* memory-read reply header */
++
++    /* Echo form: the address and length we asked for come back verbatim at
++     * [3..11], followed by the request checksum. */
++    if (n >= (int) (12 + len + 1) &&
++        rx[3] == (a & 0xFF) && rx[4] == ((a >> 8) & 0xFF) &&
++        rx[5] == ((a >> 16) & 0xFF) && rx[6] == ((a >> 24) & 0xFF) &&
++        rx[7] == (req & 0xFF) && rx[8] == ((req >> 8) & 0xFF) &&
++        rx[9] == ((req >> 16) & 0xFF) && rx[10] == ((req >> 24) & 0xFF) &&
++        rx[11] == pkt[11])
++      hdr = 12;
++    else
++      hdr = (rx[0] >> 4) == 0xF ? 3 : 0;
++
++    /* Drop a trailing reply checksum when the frame carries one. */
+     n -= hdr;
++    if (n > 0 && rx[hdr + n - 1] == goodix_body_cksum (rx, hdr + n - 1))
++      n--;
+     if (n > (int) len)
+       n = len;
+     if (n > 0)
+@@ -610,6 +650,17 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
+       line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) :
+              self->model->reset_line;
+     }
++  else if (self->model->milanl)
++    {
++      /* On the GXFP51A7 board the _CRS heuristic decodes an unrelated pad —
++       * measured: line 56, while the sensor's reset is line 264 and driving 56
++       * does nothing at all. The model's line is the one verified on this
++       * hardware, so it is used directly rather than discovered. */
++      chip_path = "/dev/gpiochip0";
++      line = self->model->reset_line;
++      fp_dbg ("reset: %s line %u (model default; _CRS discovery skipped)",
++              chip_path, line);
++    }
+   else if (gx_discover_reset (self->model->acpi_id, &disc_chip, &line))
+     {
+       chip_path = disc_chip;
+@@ -663,7 +714,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
+ static gboolean
+ gx_upload_config_and_reqtls (FpiDeviceGoodixTls *self)
+ {
+-  gx_gpio_reset (self);
++  /* 14115 must not be reset here: its factory PMK is boot-staged state and a
++   * real pulse on line 264 discards it, breaking the session. */
++  if (!self->fw_14115)
++    gx_gpio_reset (self);
+ 
+   extern const guint8 CONFIG_PCAP[];
+   extern const gsize CONFIG_PCAP_LEN;
+@@ -766,7 +820,7 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
+  * every capture fails and the sensor wedges (measured, 19 failures out of 19).
+  * Do not shorten it. */
+ #ifndef GX_SEQ_GAP_US
+-#define GX_SEQ_GAP_US 30000
++#define GX_SEQ_GAP_US 25000
+ #endif
+ 
+   static const char *seq[] = {
+@@ -799,6 +853,112 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
+     }
+ }
+ 
++/* ------------------------------------------------------------------ */
++/*  Firmware 14115 (GF_ST411SEC_APP_14115, MateBook 13 WRT-WX9)        */
++/*                                                                     */
++/*  This revision changes two things that matter here:                 */
++/*   * the 48-byte PMK is not readable from RAM — 0xF2 only ever        */
++/*     returns a boot-staged factory record (see gx_factory_read_pmk);  */
++/*   * image capture uses fixed FDT zone patterns rather than values    */
++/*     measured on the unit, in a specific order.                      */
++/*  The recipe below is the one validated against this firmware by the  */
++/*  GXFP51A0 bring-up, which shares the ST411 image path.              */
++/* ------------------------------------------------------------------ */
++
++static const guint8 GX15_FDT_BOOT[12] = {
++  0xb2, 0xb2, 0xc2, 0xc2, 0xa7, 0xa7, 0xb6, 0xb6, 0xa6, 0xa6, 0xb6, 0xb6
++};
++static const guint8 GX15_FDT_BACKGROUND[12] = {
++  0x80, 0xb0, 0x80, 0xc0, 0x80, 0xa4, 0x80, 0xb4, 0x80, 0xa3, 0x80, 0xb4
++};
++static const guint8 GX15_FDT_FINGER[12] = {
++  0x80, 0xb1, 0x80, 0xc1, 0x80, 0xa6, 0x80, 0xb6, 0x80, 0xa5, 0x80, 0xb6
++};
++static const guint8 GX15_FDT_CAPTURE_DOWN[12] = {
++  0x80, 0xb2, 0x80, 0xc2, 0x80, 0xa7, 0x80, 0xb6, 0x80, 0xa6, 0x80, 0xb6
++};
++
++/* One recipe step: a payload command (cmd, payload...) sent with the driver's
++ * usual preamble + drain, exactly as the reference implementation does. */
++static void
++gx15_step (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *payload,
++           gsize plen)
++{
++  guint8 b[32];
++  gsize n = 0;
++
++  b[n++] = cmd;
++  b[n++] = (guint8) (plen + 1);
++  b[n++] = 0;
++  memcpy (b + n, payload, plen);
++  n += plen;
++  b[n] = goodix_body_cksum (b, n);
++  n++;
++
++  {
++    gint64 t0 = g_get_monotonic_time ();
++
++    gx_send_plain_drain (self, b, n);
++    fp_dbg ("chrono cmd=%02x %ld us", cmd,
++            (long) (g_get_monotonic_time () - t0));
++  }
++}
++
++/* FDT command: state selects 0x36 (mode), 0x32 (down) or 0x34 (up). The
++ * 12 zone bytes follow a state byte and a 0x01 marker. */
++static void
++gx15_fdt (FpiDeviceGoodixTls *self, guint8 state, const guint8 zones[12])
++{
++  guint8 payload[14];
++  guint8 cmd = state == 0x0c ? 0x32 : state == 0x0e ? 0x34 : 0x36;
++
++  payload[0] = state;
++  payload[1] = 0x01;
++  memcpy (payload + 2, zones, 12);
++  gx15_step (self, cmd, payload, sizeof payload);
++}
++
++/* Runs the capture recipe for this firmware.
++ *
++ * Measured on this unit (MateBook 13 WRT-WX9, firmware APP_14115), the same
++ * short recipe works for both the background and a finger press:
++ *
++ *     MCU state 0x55
++ *     FDT(0x36, 0x0d, boot zones)   -> configure the scan
++ *     NAV  (0x50)
++ *     FDT(0x36, 0x0d, background zones) -> settle the baseline
++ *     image (0x20)
++ *
++ * The reference driver's separate "finger" recipe (finger-mode zones, a NOP,
++ * an arm via 0x32 then the image) does NOT work on this panel: the part answers
++ * the image request with a 0xD0 TLS-reconnect request and delivers no frame.
++ * That recipe belongs to the 88x80 panel of the GXFP51A0 this unit is not.
++ *
++ * The DAC registers the reference writes from OTP are likewise skipped: this
++ * unit's OTP block is 32 bytes, not the 64-byte layout those values are
++ * derived from, so there is no calibration to apply here. */
++static void
++gx15_capture_sequence (FpiDeviceGoodixTls *self, gboolean finger)
++{
++  const gint64 gap = GX_SEQ_GAP_US * self->timing_scale / 100;
++  static const guint8 mcu_55[1] = { 0x55 };
++  static const guint8 nav[2] = { 0x01, 0x00 };
++  static const guint8 img[2] = { 0x01, 0x00 };
++
++  (void) finger;
++
++  gx15_step (self, 0xae, mcu_55, sizeof mcu_55);        /* query MCU state */
++  g_usleep (gap);
++  gx15_fdt (self, 0x0d, GX15_FDT_BOOT);
++  g_usleep (gap);
++  gx15_step (self, 0x50, nav, sizeof nav);
++  g_usleep (gap);
++  gx15_fdt (self, 0x0d, GX15_FDT_BACKGROUND);
++  g_usleep (gap);
++  gx15_step (self, 0x20, img, sizeof img);              /* get image */
++  g_usleep (gap);
++}
++
+ /* MilanL capture path (GXFP51A7). Instead of the fixed sequence above, the
+  * FDT scan base is measured and the follow-up commands derived from it, as the
+  * Windows driver's gf_milanl.c does:
+@@ -915,7 +1075,12 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+   gint64 tA = g_get_monotonic_time ();
+ 
+   self->tls_reconn = FALSE;
+-  if (self->model->milanl)
++  if (self->fw_14115)
++    {
++      /* Firmware 14115: fixed FDT recipe, and no separate measured probe. */
++      gx15_capture_sequence (self, arm);
++    }
++  else if (self->model->milanl)
+     {
+       /* MilanL's sequence queries the state in clear (0xae 0x55); an extra
+        * MCU_STATE over TLS made it emit a spurious 0xD0 after the image ACK. */
+@@ -976,8 +1141,13 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+                                            img, GOODIX_RX_MAX) : -1;
+     if (got < 0)
+       {
+-        fp_warn ("cannot decrypt the image record (%d raw bytes)", raw);
+-        gx_timing_capture_failed (self);
++        /* No frame at all is not a timing problem: with the right recipe the
++         * sensor either sends the record or it does not, and stretching the
++         * delays cannot conjure one. Treating it as one used to ratchet the
++         * persisted timing scale up on every wrong-recipe attempt, which then
++         * slowed every later capture by 50% permanently. Only a record that
++         * arrives but decrypts short is evidence that delays are too tight. */
++        fp_warn ("no image record (%d raw bytes)", raw);
+         return FALSE;
+       }
+     total = (int) got;
+@@ -995,8 +1165,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+   gx_decode_12bit (img + 8, total - 8, px, GOODIX_IMG_PIXELS);
+ 
+   /* MilanL: leave the armed state after a finger frame, as the reference
+-   * driver does with fdt_up. */
+-  if (self->model->milanl && arm && self->fdt_meas_ok)
++   * driver does with fdt_up.
++   *
++   * Firmware 14115 deliberately does NOT run the reference's cleanup recipe
++   * (FDT up plus a second image request) here: measured on this unit it leaves
++   * the part unable to deliver the next frame, so an enrolment would accept
++   * only its first stage and then reject every press as "no finger". The
++   * capture recipe above is self-contained and needs no teardown. */
++  if (!self->fw_14115 && self->model->milanl && arm && self->fdt_meas_ok)
+     {
+       gx_milanl_fdt_write (self, 0x34, 0x0e, self->fdt_meas);
+       g_usleep (GX_SEQ_GAP_US * self->timing_scale / 100);
+@@ -1047,10 +1223,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
+ 
+ 
+ 
++/* Firmware 14115 finger probe.
++ *
++ * Same command byte (0x36) as the older path, but the sensor is put in
++ * finger-mode first and answers with SIX zones in a 20-byte reply:
++ *
++ *   body = 0x36 | len16 | 0 | 0 | touchflag | zone0..zone5 (16-bit each) | cksum
++ *
++ * The touch flag at body[5] carries one bit per zone. Both the flag and the
++ * zone levels are used, and the 6 zones are widened to the 12-slot array the
++ * rest of the driver expects by repeating the middle values, so the existing
++ * mean/drop thresholds keep working unchanged. */
++/* Defined with the factory-PMK code further down; gx_tls_session needs them to
++ * recover from a rejected cached key. */
++#define GX15_PMK_LEN 48
++static gboolean gx15_pmk_cache_load (guint8 pmk[GX15_PMK_LEN]);
++static void gx15_pmk_cache_save (const guint8 pmk[GX15_PMK_LEN]);
++static gboolean gx15_factory_pmk (FpiDeviceGoodixTls *self,
++                                  guint8 pmk[GX15_PMK_LEN]);
++
++#define GX15_FDT_ZONES 6
++#define GX15_TOUCH_MIN_ZONES 1
++#define GX15_FDT_ATTEMPTS 3
++#define GX15_FDT_POLLS 40    /* ~400 ms at the 10 ms poll interval */
++
++static int
++gx15_fdt_probe (FpiDeviceGoodixTls *self, int *out12, int *touchflag)
++{
++  guint8 b[32], rx[256], ty;
++  int n, k, attempt;
++  gsize len = 0;
++
++  /* 0x36 state 0x0d with the finger-mode zone pattern, as a payload command. */
++  b[len++] = 0x36;
++  b[len++] = 14 + 1;
++  b[len++] = 0;
++  b[len++] = 0x0d;
++  b[len++] = 0x01;
++  memcpy (b + len, GX15_FDT_FINGER, 12);
++  len += 12;
++  b[len] = goodix_body_cksum (b, len);
++  len++;
++
++  /* FDT manual is idempotent, and a late or stale transaction is recoverable
++   * by reissuing it, so a few bounded retries are safe. The reply can arrive
++   * noticeably later than the ACK (it is the slow path inside the capture
++   * sequence too), so poll for it rather than assuming one fixed delay. */
++  for (attempt = 0; attempt < GX15_FDT_ATTEMPTS; attempt++)
++    {
++      int got = -1;
++
++      while (gx_read_frame (self, &ty, rx, sizeof rx) > 0)
++        ;
++
++      if (!gx_send_plain_raw (self, b, len))
++        continue;
++      g_usleep (15000 * self->timing_scale / 100);
++
++      for (int poll = 0; poll < GX15_FDT_POLLS; poll++)
++        {
++          n = gx_read_frame (self, &ty, rx, sizeof rx);
++          if (n <= 0)
++            {
++              g_usleep (10000 * self->timing_scale / 100);
++              continue;
++            }
++          if (ty != GOODIX_PKT_PLAIN)
++            continue;
++          if (rx[0] == 0xb0)             /* ACK frame: keep reading */
++            continue;
++          if (rx[0] != 0x36 || n < 7 + 2 * GX15_FDT_ZONES)
++            continue;
++          if (rx[n - 1] != goodix_body_cksum (rx, n - 1))
++            continue;
++          if (((guint16) rx[1] | ((guint16) rx[2] << 8)) != (guint16) (n - 3))
++            continue;
++          got = n;
++          break;
++        }
++
++      if (got < 0)
++        continue;
++
++      if (touchflag)
++        *touchflag = rx[5] & 0x3f;
++      for (k = 0; k < 12; k++)
++        {
++          int z = k * GX15_FDT_ZONES / 12;
++
++          out12[k] = rx[7 + 2 * z] | (rx[8 + 2 * z] << 8);
++        }
++      return 0;
++    }
++  return -1;
++}
++
+ /* Native finger detection: twelve 16-bit values, one per sensor zone, in about
+  * 33 ms — some 70 times faster than capturing an image. A finger pulls those
+  * values DOWN by roughly 100 counts (around 335/371/361 idle against
+- * 229/269/275 with a finger), which is what makes cheap polling possible. */
++ * 229/269/275 with a finger), which is what makes cheap polling possible.
++ *
++ * Firmware 14115 answers this probe with a 6-zone reply instead, and only in
++ * the finger-mode configuration, so it takes its own path (gx15_fdt_probe). */
+ static int
+ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+ {
+@@ -1063,6 +1337,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+   guint8 rx[256], ty;
+   int n, k;
+ 
++  if (self->fw_14115)
++    return gx15_fdt_probe (self, out12, NULL);
++
+   /* Do NOT shorten these delays. Tested in isolation they passed 20 times out
+    * of 20 at a third of the value, but in real conditions — right after an
+    * image capture — session setup then failed. The responsiveness gained is
+@@ -1073,7 +1350,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+   g_usleep (8000 * self->timing_scale / 100);
+   n = gx_read_frame (self, &ty, rx, sizeof rx);      /* payload */
+   if (n < 31)
+-    return -1;
++    {
++      fp_dbg ("fdt probe: short reply n=%d%s", n, n > 0 ? "" : " (none)");
++      return -1;
++    }
+   for (k = 0; k < 12; k++)
+     out12[k] = rx[7 + 2 * k] | (rx[8 + 2 * k] << 8);
+   return 0;
+@@ -1173,18 +1453,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
+ {
+   static const guint8 body[] = { GOODIX_CMD_FW_VERSION, 0x03, 0x00, 0x70, 0xDC, 0xB3 };
+   guint8 rx[64], ty;
+-  int n;
++  int n, attempt;
+ 
+-  if (!gx_send_plain_raw (self, body, sizeof body))
+-    return FALSE;
+-  g_usleep (10000);
+-  gx_read_frame (self, &ty, rx, sizeof rx);          /* ACK */
+-  g_usleep (5000);
+-  n = gx_read_frame (self, &ty, rx, sizeof rx);
+-  if (n <= 3)
+-    return FALSE;
+-  g_strlcpy (out, (const gchar *) rx + 3, MIN ((gsize) (n - 3) + 1, cap));
+-  return TRUE;
++  for (attempt = 0; attempt < 3; attempt++)
++    {
++      /* One stale frame shifts every later read, so start from silence. */
++      while (gx_read_frame (self, &ty, rx, sizeof rx) > 0)
++        ;
++
++      if (!gx_send_plain_raw (self, body, sizeof body))
++        continue;
++      g_usleep (10000);
++      gx_read_frame (self, &ty, rx, sizeof rx);        /* ACK */
++      g_usleep (5000);
++      n = gx_read_frame (self, &ty, rx, sizeof rx);
++      if (n > 3 && rx[0] == GOODIX_CMD_FW_VERSION)
++        {
++          g_strlcpy (out, (const gchar *) rx + 3, MIN ((gsize) (n - 3) + 1, cap));
++          return TRUE;
++        }
++    }
++  return FALSE;
+ }
+ 
+ /* ------------------------------------------------------------------ */
+@@ -1210,8 +1499,15 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
+ /* After this many sessions in a row without a failed capture, the persisted
+  * scale steps back down by one notch. A unit that really needs the higher
+  * value fails a capture, climbs back and restarts the count, so probing costs
+- * one retried capture every few dozen sessions at most. */
+-#define GX_TIMING_DECAY_AFTER 10
++ * one retried capture every few dozen sessions at most.
++ *
++ * The count is deliberately small. A scale that is not needed makes every
++ * capture proportionally slower (150% is 50% more waiting on every recognition),
++ * which is far more noticeable than the occasional re-probe, so stepping back
++ * down quickly is the cheaper mistake. The value can never rise from a wrong
++ * capture recipe any more either: only a truncated frame counts as a timing
++ * failure, not the absence of one. */
++#define GX_TIMING_DECAY_AFTER 3
+ 
+ static int
+ gx_timing_load (int *clean)
+@@ -1332,8 +1628,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+    * one in gx_upload_config_and_reqtls). Behind a single reset the first
+    * handshake failed in every session of a run, while retries connected;
+    * with the extra pulse half of the first attempts connected (3 of 6, against
+-   * 0 of 7). A small sample, but a failed attempt costs 1.5 s and this 130 ms. */
+-  gx_gpio_reset (self);
++   * 0 of 7). A small sample, but a failed attempt costs 1.5 s and this 130 ms.
++   *
++   * Firmware 14115 is the exception: its factory PMK lives in boot-staged
++   * state, and pulsing the real reset line (264 on this board) throws that away
++   * and leaves the session unusable. There the open-time reset is the only one
++   * taken, and retries redo the dialogue without resetting. */
++  if (!self->fw_14115)
++    gx_gpio_reset (self);
+   for (att = 1; att <= 5 && !self->tls_up; att++)
+     {
+       GCancellable *c = fpi_device_get_cancellable (FP_DEVICE (self));
+@@ -1351,7 +1653,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+        * fails where a short pulse succeeds. Deep lock-ups are not a sensor
+        * state at all — they sit in the kernel's spidev driver, and only
+        * rebinding it clears them, which a userspace driver cannot do. */
+-      gx_gpio_reset (self);
++      if (!self->fw_14115)
++        gx_gpio_reset (self);
++      else if (att == 3 && self->psk_from_cache)
++        {
++          /* The cached PMK is only a guess until a handshake accepts it. If
++           * three attempts have failed with it, re-derive the key from the
++           * factory record and try that before giving up — this is what keeps
++           * a stale cache from bricking the device. */
++          guint8 fresh[GX15_PMK_LEN];
++
++          if (gx15_factory_pmk (self, fresh))
++            {
++              memcpy (self->psk, fresh, GX15_PMK_LEN);
++              self->psk_from_cache = FALSE;
++              gx15_pmk_cache_save (self->psk);
++              fp_info ("14115: cached PMK rejected; re-derived from the factory "
++                       "record");
++            }
++          else
++            fp_info ("14115: cached PMK rejected and no fresh key available");
++          memset (fresh, 0, sizeof fresh);
++        }
+     }
+   if (!self->tls_up)
+     {
+@@ -1472,16 +1795,18 @@ gx_session_start (FpiDeviceGoodixTls *self)
+     gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
+     gint64 t0 = g_get_monotonic_time ();
+ 
+-    /* Finger already down and a recent clean background on file: use it
+-     * rather than make the user lift. Only with a known idle level, so that
+-     * "finger down" is judged against this unit and not the fixed default. */
+-    if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
+-        gx_fdt_mean (cur) < self->fdt_abs &&
+-        gx_bg_load (self->bg_frame, &age))
++    /* A recent clean background on file is reused outright: it holds no
++     * fingerprint (it is only ever taken with the finger lifted) and the
++     * background drifts by ~5 counts between sessions against a finger signal
++     * of ~160, so re-measuring it on every recognition buys nothing and costs
++     * a full capture (~700 ms) before the user is even prompted. The capture
++     * is only redone when the cached one is missing, stale, or was taken with
++     * a finger down (bg_dirty). */
++    if (gx_bg_load (self->bg_frame, &age))
+       {
+-        fp_info ("finger already down: using the background saved %d s ago",
+-                 age);
++        fp_info ("using the background saved %d s ago", age);
+         reused = TRUE;
++        goto background_done;
+       }
+ 
+     while (!reused)
+@@ -1590,6 +1915,8 @@ gx_session_start (FpiDeviceGoodixTls *self)
+              (int) ((g_get_monotonic_time () - t0) / 1000));
+   }
+ 
++background_done:
++
+   /* Detection baseline. The wait above leaves the finger lifted, except when a
+    * saved background was reused; the reading is then refused as a finger
+    * below, and the known idle level stands in for it. */
+@@ -2747,6 +3074,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
+   return FALSE;
+ }
+ 
++/* ------------------------------------------------------------------ */
++/*  Factory PMK recovery for firmware 14115                            */
++/*                                                                     */
++/*  On this revision the 48-byte PMK is not sitting in RAM where 0xF2   */
++/*  would find it: every RAM read returns the same boot-staged factory  */
++/*  record instead. That record is the PMK, AES-128-CBC wrapped:        */
++/*                                                                     */
++/*    record = salt(16) || ciphertext(64) || ...                        */
++/*    key    = SHA256(salt || zeros(48) || fallback_seed(16))[:16]      */
++/*    plain  = AES-128-CBC-decrypt(key, iv = salt, ciphertext)          */
++/*             = 00 0d 00 00 00 30 || PMK(48) || ...                    */
++/*                                                                     */
++/*  The read path also corrupts the record's first byte, so it is       */
++/*  recovered by brute force: exactly one value yields that marker and  */
++/*  length. The live TLS handshake is the final validation, so a wrong  */
++/*  candidate simply fails to connect rather than silently "working".   */
++/* ------------------------------------------------------------------ */
++
++#define GX15_FACTORY_SELECTOR 0x08004000u
++#define GX15_FACTORY_READ_LEN 256u
++
++static const guint8 gx15_fallback_seed[16] = {
++  0x5c, 0xba, 0x6e, 0x25, 0x81, 0x95, 0x18, 0xde,
++  0x2d, 0x53, 0xe9, 0x6d, 0xc0, 0x34, 0x7a, 0xb0
++};
++
++/* The recovered PMK is cached: the factory record is only reliably readable at
++ * a clean boot boundary, so re-deriving it on every open would make claim
++ * failures common. The cache lives beside the other driver state, inside
++ * fprintd's writable StateDirectory, and is re-validated by the TLS handshake
++ * every time — a stale or wrong key simply fails to connect. */
++#define GX15_PMK_CACHE "/var/lib/fprint/.goodixtls-pmk"
++
++static gboolean
++gx15_pmk_cache_load (guint8 pmk[GX15_PMK_LEN])
++{
++  g_autofree gchar *data = NULL;
++  gsize len = 0;
++
++  if (!g_file_get_contents (GX15_PMK_CACHE, &data, &len, NULL) ||
++      len != GX15_PMK_LEN)
++    return FALSE;
++  memcpy (pmk, data, GX15_PMK_LEN);
++  return TRUE;
++}
++
++static void
++gx15_pmk_cache_save (const guint8 pmk[GX15_PMK_LEN])
++{
++  if (!g_file_set_contents (GX15_PMK_CACHE, (const gchar *) pmk, GX15_PMK_LEN, NULL))
++    fp_dbg ("14115: could not cache the PMK");
++  else
++    g_chmod (GX15_PMK_CACHE, 0600);
++}
++
++/* Reads the staged factory record and, on success, leaves the decoded PMK in
++ * @pmk. Returns FALSE if the record could not be read or did not decode. */
++static gboolean
++gx15_factory_pmk (FpiDeviceGoodixTls *self, guint8 pmk[GX15_PMK_LEN])
++{
++  guint8 ty, rx[512], pkt[12], staging[512];
++  guint32 a = GX15_FACTORY_SELECTOR - 0x08000000;
++  guint8 key[32], plain[128];
++  EVP_CIPHER_CTX *ctx = NULL;
++  gboolean ok = FALSE;
++  int n = -1, i, hits = 0, attempt;
++  guint8 found = 0, candidate[GX15_PMK_LEN];
++  size_t slen = 0;
++
++  pkt[0] = GOODIX_CMD_MEM_READ;
++  pkt[1] = 9;
++  pkt[2] = 0;
++  pkt[3] = a;
++  pkt[4] = a >> 8;
++  pkt[5] = a >> 16;
++  pkt[6] = a >> 24;
++  pkt[7] = GX15_FACTORY_READ_LEN;
++  pkt[8] = GX15_FACTORY_READ_LEN >> 8;
++  pkt[9] = 0;
++  pkt[10] = 0;
++  pkt[11] = goodix_body_cksum (pkt, 11);
++
++  /* This is the last line of defence for the key, so it retries instead of
++   * giving up on one bad read. A bus left desynchronised by a previous run
++   * (a reply still unread) makes the first attempts useless; draining plus,
++   * from the third attempt, a full reopen of the node clears that. A reset is
++   * deliberately not used: if the key has already been lost, destroying more
++   * state cannot help. */
++  for (attempt = 1; attempt <= 6; attempt++)
++    {
++      while (gx_read_frame (self, &ty, rx, sizeof rx) > 0)
++        ;
++
++      if (attempt >= 3 && self->spi_path)
++        {
++          if (self->spi_fd >= 0)
++            close (self->spi_fd);
++          self->spi_fd = open (self->spi_path, O_RDWR);
++          if (self->spi_fd < 0)
++            return FALSE;
++          {
++            guint8 mode = SPI_MODE_0, bits = 8;
++            guint32 speed = 10000000;
++            ioctl (self->spi_fd, SPI_IOC_WR_MODE, &mode);
++            ioctl (self->spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
++            ioctl (self->spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
++          }
++          flock (self->spi_fd, LOCK_EX | LOCK_NB);
++        }
++
++      if (!gx_send_plain_raw (self, pkt, sizeof pkt))
++        continue;
++      g_usleep (12000 * self->timing_scale / 100);
++      gx_read_frame (self, &ty, rx, sizeof rx);         /* ACK */
++      g_usleep (10000 * self->timing_scale / 100);
++      n = gx_read_frame (self, &ty, rx, sizeof rx);
++      if (n <= 12 || rx[0] != GOODIX_CMD_MEM_READ)
++        {
++          fp_dbg ("14115: factory record read attempt %d: n=%d", attempt, n);
++          continue;
++        }
++
++      /* Reply: cmd, len16, addr echo(4), len echo(4), req cksum, record, cksum */
++      if (!(rx[3] == (a & 0xFF) && rx[4] == ((a >> 8) & 0xFF) &&
++            rx[5] == ((a >> 16) & 0xFF) && rx[6] == ((a >> 24) & 0xFF)))
++        {
++          fp_dbg ("14115: factory record reply is not the expected staging form");
++          continue;
++        }
++      slen = (size_t) n - 12;
++      if (slen > sizeof staging)
++        slen = sizeof staging;
++      memcpy (staging, rx + 11, slen);      /* includes the trailing checksum */
++
++      /* The record's first byte is unreliable on this read path, so it is
++       * recovered by brute force: exactly one value must yield the 0x000d
++       * marker and a 48-byte length. */
++      hits = 0;
++      found = 0;
++      for (i = 0; i < 256 && slen >= 16 + 64; i++)
++        {
++          guint8 rec[128];
++          int out1 = 0, out2 = 0;
++
++          memcpy (rec, staging, slen < sizeof rec ? slen : sizeof rec);
++          rec[0] = (guint8) i;
++
++          {
++            guint8 inp[80];
++            unsigned int dl = 0;
++
++            memcpy (inp, rec, 16);
++            memset (inp + 16, 0, 48);
++            memcpy (inp + 64, gx15_fallback_seed, 16);
++            if (EVP_Digest (inp, sizeof inp, key, &dl, EVP_sha256 (), NULL) != 1)
++              break;
++          }
++
++          ctx = EVP_CIPHER_CTX_new ();
++          if (!ctx)
++            break;
++          if (EVP_DecryptInit_ex (ctx, EVP_aes_128_cbc (), NULL, key, rec) == 1 &&
++              EVP_CIPHER_CTX_set_padding (ctx, 0) == 1 &&
++              EVP_DecryptUpdate (ctx, plain, &out1, rec + 16, 64) == 1 &&
++              EVP_DecryptFinal_ex (ctx, plain + out1, &out2) == 1)
++            {
++              if (plain[0] == 0x00 && plain[1] == 0x0d &&
++                  (((guint32) plain[2] << 24) | ((guint32) plain[3] << 16) |
++                   ((guint32) plain[4] << 8) | plain[5]) == GX15_PMK_LEN)
++                {
++                  hits++;
++                  found = (guint8) i;
++                  memcpy (candidate, plain + 6, GX15_PMK_LEN);
++                }
++            }
++          EVP_CIPHER_CTX_free (ctx);
++          ctx = NULL;
++        }
++
++      if (hits == 1)
++        break;
++
++      fp_dbg ("14115: factory record attempt %d gave %d candidates",
++              attempt, hits);
++      g_usleep (20000);
++    }
++
++  if (hits == 1)
++    {
++      memcpy (pmk, candidate, GX15_PMK_LEN);
++      fp_info ("14115: factory PMK recovered (record first byte 0x%02x)", found);
++      ok = TRUE;
++    }
++  else
++    {
++      fp_warn ("14115: factory PMK recovery gave %d candidates (need exactly 1)",
++               hits);
++    }
++
++  memset (key, 0, sizeof key);
++  memset (plain, 0, sizeof plain);
++  memset (candidate, 0, sizeof candidate);
++  return ok;
++}
++
+ /* Picks the model from the ACPI id behind the spidev node:
+  * /dev/spidev0.0 -> /sys/class/spidev/spidev0.0/device -> ../spi-GXFP51A7:00.
+  * Falls back to the GXFP5187, whose path this driver was validated on. */
+@@ -2782,6 +3314,8 @@ gx_dev_open (FpDevice *dev)
+   path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
+   self->model = gx_model_for (path);
+   self->fdt_meas_ok = FALSE;
++  g_free (self->spi_path);
++  self->spi_path = g_strdup (path);
+   self->spi_fd = open (path, O_RDWR);
+   if (self->spi_fd < 0)
+     {
+@@ -2823,14 +3357,52 @@ gx_dev_open (FpDevice *dev)
+   if (self->timing_scale != 100)
+     fp_info ("starting from learned timing scale %d%%", self->timing_scale);
+ 
+-  gx_gpio_reset (self);
+-
++  /* Read the firmware version first: it decides whether the reset below may be
++   * taken at all. On 14115 the factory PMK is boot-staged state, and pulsing
++   * line 264 on this board discards it, so that part must not be reset.
++   *
++   * A failed read must NOT be taken to mean "older firmware". Doing so sent the
++   * driver down the RAM-key path (which cannot work here) and, worse, through
++   * the reset that throws the boot-staged key away — one transient read failure
++   * then left the device unusable until a manual recovery. When the version is
++   * unknown, a cached PMK for this unit is the safer signal, and no reset is
++   * taken. */
+   if (gx_read_fw_version (self, fw, sizeof fw))
+     fp_info ("%s firmware: %s", self->model->acpi_id, fw);
+-  psk_addr = gx_psk_addr (self, fw);
+-  fp_dbg ("reading PSK from RAM address 0x%08x", psk_addr);
+-  if (!gx_read_psk (self, path, psk_addr))
+-    fp_warn ("key read failed; the TLS channel cannot be opened");
++  self->fw_14115 = g_str_has_suffix (fw, "APP_14115");
++
++  if (self->fw_14115)
++    {
++      if (gx15_pmk_cache_load (self->psk))
++        {
++          self->psk_from_cache = TRUE;
++          fp_info ("14115: PMK from cache");
++        }
++      else if (gx15_factory_pmk (self, self->psk))
++        {
++          fp_info ("14115: using the recovered factory PMK");
++          gx15_pmk_cache_save (self->psk);
++        }
++      else
++        fp_warn ("14115: could not recover the factory PMK");
++    }
++  else if (fw[0] == '\0' && gx15_pmk_cache_load (self->psk))
++    {
++      /* Firmware id not readable, but this unit has a known PMK: treat it as
++       * 14115 (the only firmware that caches one), and do not reset. */
++      self->fw_14115 = TRUE;
++      self->psk_from_cache = TRUE;
++      fp_warn ("firmware id unreadable; using the cached PMK and skipping the "
++               "reset (assumed 14115)");
++    }
++  else
++    {
++      gx_gpio_reset (self);
++      psk_addr = gx_psk_addr (self, fw);
++      fp_dbg ("reading PSK from RAM address 0x%08x", psk_addr);
++      if (!gx_read_psk (self, path, psk_addr))
++        fp_warn ("key read failed; the TLS channel cannot be opened");
++    }
+ 
+   fpi_device_open_complete (dev, NULL);
+ }
+@@ -2996,6 +3568,7 @@ fpi_device_goodixtls_finalize (GObject *object)
+ 
+   if (self->spi_fd >= 0)
+     close (self->spi_fd);
++  g_clear_pointer (&self->spi_path, g_free);
+   g_clear_pointer (&self->bg_frame, g_free);
+   G_OBJECT_CLASS (fpi_device_goodixtls_parent_class)->finalize (object);
+ }

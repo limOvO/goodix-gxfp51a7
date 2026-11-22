@@ -1,0 +1,25 @@
+# Build output
+stage/
+pc-stage/
+sources/*/build/
+
+# Toolchain (recreated by toolchain/setup.sh: venv, extracted glib tools)
+toolchain/venv/
+toolchain/bin/
+toolchain/pc/
+
+# Cloned sources (recreated by bootstrap.sh)
+sources/
+.goodixtls-*
+
+# Compiled helpers and scratch
+gx-reset
+test-direct
+diagnostics/__pycache__/
+__pycache__/
+*.pyc
+*.o
+*.so
+
+# Local state
+*.log
