@@ -31,10 +31,11 @@ them required reading the sensor's own protocol off the bus.
 | Finger detection | idle mean 356 → floor 332, drop 98–125 on press |
 | Image capture | 22189-byte frame on every attempt |
 | Enrolment progress | **12 consecutive stages**, keypoints 143 → 854, extent 107×87 → 253×227 |
+| Match scores (fresh background) | 24-28 against a threshold of 20 |
 
 **What is not yet confirmed:** a completed 20-stage enrolment and a matching
 verify. Both need ~20 physical presses, which cannot be automated. The capture
-path is proven; the end-to-end enrolment is a manual step (see §8).
+path is proven; the end-to-end enrolment is a manual step (see §9).
 
 ---
 
@@ -203,8 +204,8 @@ Driver state lives in fprintd's writable `StateDirectory`:
 
 ## 5. Changes made
 
-All driver changes are in **`01-app-14115-support.patch`** — 628 insertions,
-55 deletions across `goodixtls.c`. It has been verified to apply cleanly to a
+All driver changes are in **`01-app-14115-support.patch`** — 641 insertions,
+57 deletions across `goodixtls.c` and `goodix_tls.c`. It has been verified to apply cleanly to a
 pristine clone and reproduce the working source byte-for-byte.
 
 | Area | Change |
@@ -217,6 +218,7 @@ pristine clone and reproduce the working source byte-for-byte.
 | Firmware detect | retry; unreadable ⇒ assume 14115 if a key is cached |
 | Cleanup | removed (the reference teardown broke the next frame) |
 | Speed | reuse cached background; fix timing-scale ratchet; retune delays |
+| TLS (`goodix_tls.c`) | validate all CBC padding bytes, not just the last |
 
 Non-driver pieces, all in the project directory:
 
@@ -233,29 +235,42 @@ Non-driver pieces, all in the project directory:
 ## 6. Performance
 
 Recognition felt slow, so each phase was measured rather than guessed at
-(`fp_dbg` timestamps per protocol step). Three causes, in order of impact:
+(`fp_dbg` timestamps per protocol step).
 
 | | before | after |
 |---|---|---|
-| Session start | 1581 ms | **553 ms** |
-| Single capture | ~900 ms | **649 ms** |
+| Single capture | ~900 ms | **~649 ms** |
+| Session start | 1581 ms | ~1260 ms |
 
-**1. A whole capture was discarded on every recognition.** `gx_session_start`
-always re-measured the background frame, ~700 ms, before the user was even
-prompted. A cached background was already on disk and is only ever written with
-the finger confirmed *lifted* — so it contains no fingerprint — and the
-background drifts by ~5 counts between sessions against a finger signal of ~160.
-Retaking it bought nothing. It is now reused while fresh, and still retaken when
-missing, stale, or captured with a finger down.
+**A caching idea that had to be reverted — and why it matters.** Reusing the
+background frame across recognitions looked like a free ~700 ms: the frame holds
+no fingerprint, because it is only ever taken with the finger lifted. It is not
+free. The sensor's baseline drifts within tens of seconds, so an older
+background yields a distorted difference image and the matcher collapses.
 
-**2. The timing scale was stuck at 150%.** A ratchet bug: a capture returning
+Measured on real verifications, the same enrolled template scored:
+
+| background | scores | threshold 20 |
+|---|---|---|
+| fresh each time | 24, 26, 27, 28 | matches |
+| cached (up to 2 h) | 0, 0, 2, 3, 7 | **never matches** |
+
+That was a genuine regression I introduced, and it is why recognition stopped
+working. The behaviour is now upstream's again: a fresh background before every
+operation, with the cache used only when a finger is already down. The cache age
+was also cut from 2 h to 20 s so a stale frame cannot be picked up elsewhere.
+The upstream comment already said this ("a background captured too early ...
+collapses the score"); I should have trusted it instead of measuring only
+latency.
+
+**1. The timing scale was stuck at 150%.** A ratchet bug: a capture returning
 *zero* bytes was treated as "delays too tight" and raised the persisted
 multiplier by 50% each time. No amount of extra delay can make a missing frame
 appear — the real cause was the wrong capture recipe (§3.3), since fixed. Only a
 frame that arrives but decrypts short now counts as a timing failure, and the
 step-down is quick (3 clean sessions) so an unneeded scale cannot persist.
 
-**3. Conservative protocol delays.** Re-measured per point, 5–6 captures each:
+**2. Conservative protocol delays.** Re-measured per point, 5–6 captures each:
 
 | drain silence | result |
 |---|---|
@@ -266,12 +281,40 @@ step-down is quick (3 clean sessions) so an unneeded scale cannot persist.
 also went from 30 ms to 25 ms (measured 6/6 at that setting, 5/6 at 15 ms, which
 is why 25 was kept rather than the fastest value).
 
-Total: session start **2.9× faster**, capture **1.4× faster**. Verified 4/4
-clean runs with zero errors afterwards.
+Net effect on capture: **1.4x faster**, with matching left intact.
 
 ---
 
-## 7. Verification
+## 7. An upstream TLS bug found on the way
+
+Rebuilding from a clean clone occasionally failed the driver's own TLS test
+(`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
+unmodified upstream, so it was not caused by this work, but it turned out to be
+a real defect rather than a flaky assertion.
+
+`gx_tls_decrypt_record` validated only the **last** padding byte of a CBC
+record. TLS 1.2 (RFC 5246 §6.2.3.2) requires all N+1 padding bytes to equal N.
+The gap is reachable by accident: flipping the final *ciphertext* byte garbles
+only the last plaintext block — which holds nothing but the padding — and if the
+garbled final byte happens to name a length that still fits, the MAC over the
+(intact) content still verifies, so a **corrupted record is accepted**. With 16
+padding bytes that is a 1-in-256 event per tampered record, which is exactly the
+observed rate.
+
+The fix checks every padding byte. Measured:
+
+| | runs | passes |
+|---|---|---|
+| upstream, unmodified | 60 | 58 |
+| upstream + this fix | 120 | **120** |
+| this build | 150 | **150** |
+
+Hardware unaffected: real captures still decrypt 3/3, because the stricter check
+only rejects records whose padding was actually tampered with.
+
+---
+
+## 8. Verification
 
 Repeated, measured, on the final build:
 
@@ -298,7 +341,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 8. Remaining work
+## 9. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -321,7 +364,7 @@ password always remains available as a fallback.
 
 ---
 
-## 9. Security notes
+## 10. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -337,7 +380,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 10. Provenance
+## 11. Provenance
 
 Reverse-engineering input, all public:
 

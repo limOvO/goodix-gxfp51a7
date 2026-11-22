@@ -1,5 +1,34 @@
+diff --git a/goodix_tls.c b/goodix_tls.c
+index aa233c6..0b1ce10 100644
+--- a/goodix_tls.c
++++ b/goodix_tls.c
+@@ -470,11 +470,22 @@ gx_tls_decrypt_record (GxTls *t, const guint8 *raw, gsize raw_len,
+   EVP_CIPHER_CTX_free (c);
+   plain_len += tmp;
+ 
+-  /* plaintext = content || MAC || padding, where every padding byte carries
+-   * the padding length and the final byte is that length. */
++  /* plaintext = content || MAC || padding. TLS 1.2 (RFC 5246 6.2.3.2) says
++   * the padding is N+1 bytes that ALL equal N, so a record whose padding has
++   * been tampered with must be rejected.
++   *
++   * Only reading the final byte is not enough: flipping the last *ciphertext*
++   * byte garbles the final block, and if the resulting last byte happens to
++   * name a length that still fits, the (intact) MAC over the content can still
++   * match and a corrupted record is accepted. That is a real, measurable
++   * 1-in-~256 event per tampered record, and it is what made the driver's own
++   * TLS test flake. Verifying every padding byte closes it. */
+   pad = (gsize) plain[plain_len - 1] + 1;
+   if ((gsize) plain_len < pad + MAC_LEN)
+     return -1;
++  for (gsize i = 0; i < pad; i++)
++    if (plain[plain_len - 1 - i] != plain[plain_len - 1])
++      return -1;
+   content_len = (gsize) plain_len - pad - MAC_LEN;
+   if (content_len > out_cap)
+     return -1;
 diff --git a/goodixtls.c b/goodixtls.c
-index 8b41bcb..7b21896 100644
+index 8b41bcb..1a8715a 100644
 --- a/goodixtls.c
 +++ b/goodixtls.c
 @@ -43,6 +43,7 @@
@@ -570,42 +599,32 @@ index 8b41bcb..7b21896 100644
      }
    if (!self->tls_up)
      {
-@@ -1472,16 +1795,18 @@ gx_session_start (FpiDeviceGoodixTls *self)
+@@ -1382,7 +1705,7 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+  * ever taken with the finger lifted — and is used only while recent, since
+  * drift over hours (temperature) was not measured. */
+ #define GX_BG_FILE "/var/lib/fprint/.goodixtls-bg"
+-#define GX_BG_MAX_AGE_S (2 * 3600)
++#define GX_BG_MAX_AGE_S 20   /* drift is visible within tens of s */
+ 
+ static gboolean
+ gx_bg_load (guint16 *bg, int *age_s)
+@@ -1472,9 +1795,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
      gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
      gint64 t0 = g_get_monotonic_time ();
  
 -    /* Finger already down and a recent clean background on file: use it
 -     * rather than make the user lift. Only with a known idle level, so that
 -     * "finger down" is judged against this unit and not the fixed default. */
--    if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
--        gx_fdt_mean (cur) < self->fdt_abs &&
--        gx_bg_load (self->bg_frame, &age))
-+    /* A recent clean background on file is reused outright: it holds no
-+     * fingerprint (it is only ever taken with the finger lifted) and the
-+     * background drifts by ~5 counts between sessions against a finger signal
-+     * of ~160, so re-measuring it on every recognition buys nothing and costs
-+     * a full capture (~700 ms) before the user is even prompted. The capture
-+     * is only redone when the cached one is missing, stale, or was taken with
-+     * a finger down (bg_dirty). */
-+    if (gx_bg_load (self->bg_frame, &age))
-       {
--        fp_info ("finger already down: using the background saved %d s ago",
--                 age);
-+        fp_info ("using the background saved %d s ago", age);
-         reused = TRUE;
-+        goto background_done;
-       }
- 
-     while (!reused)
-@@ -1590,6 +1915,8 @@ gx_session_start (FpiDeviceGoodixTls *self)
-              (int) ((g_get_monotonic_time () - t0) / 1000));
-   }
- 
-+background_done:
-+
-   /* Detection baseline. The wait above leaves the finger lifted, except when a
-    * saved background was reused; the reading is then refused as a finger
-    * below, and the known idle level stands in for it. */
++    /* NOTE: a cached background must NOT be reused for a fresh operation.
++     * Measured upstream (and reproduced here at 0-3 matches against a
++     * threshold of 20): the sensor's baseline drifts within tens of seconds,
++     * so a background taken earlier yields a distorted difference image and
++     * the matcher collapses. The cache is only used in the two cases below,
++     * where the finger is already down and waiting for it to lift would be
++     * worse than a slightly stale frame. */
+     if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
+         gx_fdt_mean (cur) < self->fdt_abs &&
+         gx_bg_load (self->bg_frame, &age))
 @@ -2747,6 +3074,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
    return FALSE;
  }

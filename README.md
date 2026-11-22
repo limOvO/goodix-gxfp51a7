@@ -96,33 +96,28 @@ guards were added after that happened in practice:
   Measured: recovery on a deliberately desynchronised bus produces a key
   byte-identical to the original.
 
+### An upstream TLS bug this work also fixes
+
+The patch additionally corrects a real defect in `goodix_tls.c`: CBC record
+padding was validated only on its final byte, where TLS 1.2 requires all of it
+to match. A record whose last ciphertext byte was flipped could therefore be
+accepted — a 1-in-256 event, which is what made the driver's own TLS test flake
+(~1 run in 30, reproducible on pristine upstream). With the check added, that
+test passes 150/150.
+
 ## Speed
 
-Recognition was taking noticeably long. Measured and fixed:
+Capture was measured per protocol step and retuned: **~900 ms → ~649 ms**, from a
+stuck timing multiplier and over-cautious protocol delays. What that cost, and
+what does *not* work, is worth stating.
 
-| | before | after |
-|---|---|---|
-| Session start | 1581 ms | **~553 ms** |
-| Single capture | ~900 ms | **~649 ms** |
-
-Three causes, in order of impact:
-
-1. **A whole capture was thrown away on every recognition.** The background
-   frame was re-measured each time, costing ~700 ms *before* the user was even
-   prompted — yet a cached background was already on disk and is only ever
-   saved with the finger confirmed lifted (so it holds no fingerprint). It is
-   now reused while fresh, and only retaken if missing, stale, or taken with a
-   finger down.
-2. **The timing scale was stuck at 150%.** A previous bug treated "no frame at
-   all" as "timings too tight" and ratcheted the persisted multiplier up 50% at
-   a time. Stretching delays can never make a missing frame appear, so this only
-   ever slowed things down. That failure no longer counts as a timing problem,
-   and the recovery step-down is now quick (3 clean sessions) so an unneeded
-   scale cannot persist.
-3. **Drain silence and sequence gaps were conservative.** Re-measured at
-   5–6 captures per point: drain 4 → 3 takes a capture from 724 ms to 615 ms and
-   stays 6/6 reliable, while 2 gives *zero* usable frames — a hard cliff, so 3
-   is the floor. The sequence gap went from 30 ms to 25 ms.
+**Do not cache the background frame.** It looks like a free ~700 ms — it holds
+no fingerprint, being taken only with the finger lifted — but the sensor's
+baseline drifts within tens of seconds, so an older background distorts the
+difference image and the matcher collapses. Measured on the same enrolled
+template: **24–28 (matches, threshold 20) with a fresh background, 0–3 (never
+matches) with a cached one.** A fresh background before every operation is part
+of the measurement, not overhead.
 
 ## Build
 
