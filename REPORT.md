@@ -35,7 +35,7 @@ them required reading the sensor's own protocol off the bus.
 
 **What is not yet confirmed:** a completed 20-stage enrolment and a matching
 verify. Both need ~20 physical presses, which cannot be automated. The capture
-path is proven; the end-to-end enrolment is a manual step (see §9).
+path is proven; the end-to-end enrolment is a manual step (see §10).
 
 ---
 
@@ -218,6 +218,8 @@ pristine clone and reproduce the working source byte-for-byte.
 | Firmware detect | retry; unreadable ⇒ assume 14115 if a key is cached |
 | Cleanup | removed (the reference teardown broke the next frame) |
 | Speed | attempted, reverted (see §6) |
+| Capture recipe | two phases, fdt_down re-armed before every frame (see §7) |
+| 0xD0 handling | reconnect the TLS session and retry once |
 | TLS (`goodix_tls.c`) | validate all CBC padding bytes, not just the last |
 
 Non-driver pieces, all in the project directory:
@@ -258,7 +260,53 @@ from the background path.
 
 ---
 
-## 7. An upstream TLS bug found on the way
+## 7. The capture recipe, per the GXFP51A0 reference
+
+A later, more detailed source —
+[szlukabence/goodix-fingerprint-spi-linux](https://github.com/szlukabence/goodix-fingerprint-spi-linux)
+— documents the capture sequence for this sensor family, and it corrected one
+thing this driver had wrong.
+
+Its key warning:
+
+> **`fdt_down` must be (re)armed before every frame.** Arming once per burst
+> yields one usable frame and then stale/empty ones.
+
+An earlier simplification here had collapsed the finger path into the background
+path, removing that arming step — which is exactly the "one good frame, then
+nothing" pattern the failures showed. The recipe is now two explicit phases:
+
+```
+background:  mcu_state ; fdt_mode(boot) ; nav ; fdt_mode(background) ; get_image
+finger:      fdt_mode(finger) ; fdt_down(finger)
+             nop ; mcu_state
+             fdt_down(capture: 80b2 80c2 80a7 80b6 80a6 80b6)
+             get_image
+```
+
+All four zone blocks were verified byte-for-byte against the reference
+(`b2b2 c2c2 a7a7 b6b6 a6a6 b6b6`, `80b0 …`, `80b1 …`, `80b2 80c2 80a7 80b6 80a6 80b6`).
+
+Two of its other findings do **not** apply here, and were checked rather than
+assumed:
+
+- **`SPI_CS_HIGH`** is required on the 51A0 board. It is not needed on this one:
+  our driver has always run `SPI_MODE_0` without it and reads the firmware
+  version reliably.
+- **88x80 geometry with a 64-column active area** is that panel. This unit
+  returns 22189-byte records = 132x112 (14784 px), the larger sibling, and the
+  decode matches exactly.
+
+Also implemented from the protocol docs: a **0xD0 reply now triggers a session
+reconnect and one retry** instead of failing. The sensor uses 0xD0 to ask for a
+fresh TLS session after its state fails to advance; the vendor driver restarts
+its init thread on it, and this driver previously only logged a warning. The
+drain now aborts immediately on 0xD0 so the remaining commands are not sent into
+a dead session.
+
+---
+
+## 8. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -287,7 +335,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 8. Verification
+## 9. Verification
 
 Repeated, measured, on the final build:
 
@@ -314,7 +362,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 9. Remaining work
+## 10. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -337,7 +385,7 @@ password always remains available as a fallback.
 
 ---
 
-## 10. Security notes
+## 11. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -353,7 +401,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 11. Provenance
+## 12. Provenance
 
 Reverse-engineering input, all public:
 
@@ -364,6 +412,9 @@ Reverse-engineering input, all public:
   mechanism and the capture recipes
 - [`delitdesnoyers06-del/goodix-gxfp-protocol`](https://github.com/delitdesnoyers06-del/goodix-gxfp-protocol)
   — protocol notes for GXFP5187/51A7
+- [`szlukabence/goodix-fingerprint-spi-linux`](https://github.com/szlukabence/goodix-fingerprint-spi-linux)
+  — protocol specification and imaging method for this family; source of the
+  re-arm-before-every-frame requirement
 - libfprint TOD fork: `3v1n0/libfprint`, tag `v1.94.10+tod1`
 
 No vendor binaries, firmware images or captured biometric data are included. The

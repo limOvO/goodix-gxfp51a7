@@ -123,6 +123,30 @@ On this part the conservative timings are load bearing. The rule this produced:
 only a capture *with a finger on the sensor* validates a protocol change, since
 that path behaves differently from the background path.
 
+## The capture recipe
+
+The most important detail, from the
+[GXFP51A0 protocol reference](https://github.com/szlukabence/goodix-fingerprint-spi-linux):
+
+> **`fdt_down` must be (re)armed before every frame.** Arming once yields one
+> usable frame and then stale or empty ones.
+
+So capture is two explicit phases, each arming for its own frame:
+
+```
+background:  mcu_state ; fdt_mode(boot) ; nav ; fdt_mode(background) ; get_image
+finger:      fdt_mode(finger) ; fdt_down(finger)
+             nop ; mcu_state
+             fdt_down(capture) ; get_image
+```
+
+A 0xD0 reply means the sensor wants a fresh TLS session; the driver reconnects
+and retries once instead of failing.
+
+Two findings from that reference do **not** apply here, and were checked rather
+than assumed: `SPI_CS_HIGH` (needed on the 51A0 board, not on this one) and the
+88x80 / 64-column geometry (this unit is 132x112).
+
 ## Build
 
 Arch does not ship the TOD headers, and `glib-mkenums` lives in `glib2-devel`,
