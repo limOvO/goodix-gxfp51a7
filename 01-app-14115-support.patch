@@ -28,7 +28,7 @@ index aa233c6..0b1ce10 100644
    if (content_len > out_cap)
      return -1;
 diff --git a/goodixtls.c b/goodixtls.c
-index 8b41bcb..99aa112 100644
+index 8b41bcb..4eb61fd 100644
 --- a/goodixtls.c
 +++ b/goodixtls.c
 @@ -43,6 +43,7 @@
@@ -413,7 +413,44 @@ index 8b41bcb..99aa112 100644
      if (self->tls_rxlen > self->tls_rxpos)
        {
          raw = self->tls_rxlen - self->tls_rxpos;
-@@ -995,8 +1243,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -962,8 +1210,13 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+             if (raw > 0 && ty == GOODIX_PKT_PLAIN && rec[0] == 0xD0)
+               {
+                 /* The MCU asks for a TLS reconnect instead of sending the
+-                 * image (seen on MilanL when its state did not advance). */
++                 * image (seen when its state did not advance). Record it: the
++                 * retry below re-establishes the session. Noting it here is
++                 * the whole point - the check above the loop only sees a 0xD0
++                 * that arrived during the capture *sequence*, and this one
++                 * arrives later, while waiting for the image. */
+                 fp_warn ("sensor asked for a TLS reconnect instead of the image");
++                self->tls_reconn = TRUE;
+                 raw = 0;
+                 break;
+               }
+@@ -972,6 +1225,21 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+           }
+       }
+ 
++    /* A 0xD0 seen while waiting means the session is gone; retry once on a
++     * fresh one. Checked here because this is where most of them surface. */
++    if (self->tls_reconn && !reconnect_attempted)
++      {
++        fp_info ("sensor requested a TLS reconnect; re-establishing the session");
++        gx_tls_teardown (self);
++        if (!gx_tls_session (self))
++          {
++            fp_warn ("reconnect failed");
++            gx_timing_capture_failed (self);
++            return FALSE;
++          }
++        return gx_capture_frame_ex (self, px, arm, TRUE);
++      }
++
+     got = raw > 0 ? gx_tls_decrypt_record (self->tls, rec, raw,
+                                            img, GOODIX_RX_MAX) : -1;
+     if (got < 0)
+@@ -995,8 +1263,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
    gx_decode_12bit (img + 8, total - 8, px, GOODIX_IMG_PIXELS);
  
    /* MilanL: leave the armed state after a finger frame, as the reference
@@ -430,7 +467,7 @@ index 8b41bcb..99aa112 100644
      {
        gx_milanl_fdt_write (self, 0x34, 0x0e, self->fdt_meas);
        g_usleep (GX_SEQ_GAP_US * self->timing_scale / 100);
-@@ -1047,10 +1301,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
+@@ -1047,10 +1321,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
  
  
  
@@ -540,7 +577,7 @@ index 8b41bcb..99aa112 100644
  static int
  gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
  {
-@@ -1063,6 +1415,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1063,6 +1435,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    guint8 rx[256], ty;
    int n, k;
  
@@ -550,7 +587,7 @@ index 8b41bcb..99aa112 100644
    /* Do NOT shorten these delays. Tested in isolation they passed 20 times out
     * of 20 at a third of the value, but in real conditions — right after an
     * image capture — session setup then failed. The responsiveness gained is
-@@ -1073,7 +1428,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1073,7 +1448,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    g_usleep (8000 * self->timing_scale / 100);
    n = gx_read_frame (self, &ty, rx, sizeof rx);      /* payload */
    if (n < 31)
@@ -562,7 +599,7 @@ index 8b41bcb..99aa112 100644
    for (k = 0; k < 12; k++)
      out12[k] = rx[7 + 2 * k] | (rx[8 + 2 * k] << 8);
    return 0;
-@@ -1173,18 +1531,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
+@@ -1173,18 +1551,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
  {
    static const guint8 body[] = { GOODIX_CMD_FW_VERSION, 0x03, 0x00, 0x70, 0xDC, 0xB3 };
    guint8 rx[64], ty;
@@ -601,7 +638,7 @@ index 8b41bcb..99aa112 100644
  }
  
  /* ------------------------------------------------------------------ */
-@@ -1332,8 +1699,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+@@ -1332,8 +1719,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
     * one in gx_upload_config_and_reqtls). Behind a single reset the first
     * handshake failed in every session of a run, while retries connected;
     * with the extra pulse half of the first attempts connected (3 of 6, against
@@ -618,7 +655,7 @@ index 8b41bcb..99aa112 100644
    for (att = 1; att <= 5 && !self->tls_up; att++)
      {
        GCancellable *c = fpi_device_get_cancellable (FP_DEVICE (self));
-@@ -1351,7 +1724,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+@@ -1351,7 +1744,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
         * fails where a short pulse succeeds. Deep lock-ups are not a sensor
         * state at all — they sit in the kernel's spidev driver, and only
         * rebinding it clears them, which a userspace driver cannot do. */
@@ -648,7 +685,7 @@ index 8b41bcb..99aa112 100644
      }
    if (!self->tls_up)
      {
-@@ -1472,9 +1866,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
+@@ -1472,9 +1886,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
      gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
      gint64 t0 = g_get_monotonic_time ();
  
@@ -665,7 +702,7 @@ index 8b41bcb..99aa112 100644
      if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
          gx_fdt_mean (cur) < self->fdt_abs &&
          gx_bg_load (self->bg_frame, &age))
-@@ -2747,6 +3145,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
+@@ -2747,6 +3165,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
    return FALSE;
  }
  
@@ -877,7 +914,7 @@ index 8b41bcb..99aa112 100644
  /* Picks the model from the ACPI id behind the spidev node:
   * /dev/spidev0.0 -> /sys/class/spidev/spidev0.0/device -> ../spi-GXFP51A7:00.
   * Falls back to the GXFP5187, whose path this driver was validated on. */
-@@ -2782,6 +3385,8 @@ gx_dev_open (FpDevice *dev)
+@@ -2782,6 +3405,8 @@ gx_dev_open (FpDevice *dev)
    path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
    self->model = gx_model_for (path);
    self->fdt_meas_ok = FALSE;
@@ -886,7 +923,7 @@ index 8b41bcb..99aa112 100644
    self->spi_fd = open (path, O_RDWR);
    if (self->spi_fd < 0)
      {
-@@ -2823,14 +3428,52 @@ gx_dev_open (FpDevice *dev)
+@@ -2823,14 +3448,52 @@ gx_dev_open (FpDevice *dev)
    if (self->timing_scale != 100)
      fp_info ("starting from learned timing scale %d%%", self->timing_scale);
  
@@ -945,7 +982,7 @@ index 8b41bcb..99aa112 100644
  
    fpi_device_open_complete (dev, NULL);
  }
-@@ -2996,6 +3639,7 @@ fpi_device_goodixtls_finalize (GObject *object)
+@@ -2996,6 +3659,7 @@ fpi_device_goodixtls_finalize (GObject *object)
  
    if (self->spi_fd >= 0)
      close (self->spi_fd);

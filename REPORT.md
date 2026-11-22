@@ -316,6 +316,18 @@ reconnect and one retry** instead of failing. The sensor asks for a fresh TLS
 session when its state does not advance — the vendor driver restarts its init
 thread on it — and this driver previously only logged a warning.
 
+A 0xD0 can arrive at two points, and both are now handled. The first version of
+this only covered one, which is why the sensor could still wedge completely:
+
+| where the 0xD0 arrives | handled |
+|---|---|
+| during the capture sequence (drain) | aborts the sequence, then retries |
+| while waiting for the image record | **was missed** — set the flag but never acted on it |
+
+The second path is the common one, so a wedge could leave the sensor answering
+nothing at all until a manual recovery. Both now set `tls_reconn` and retry once
+on a fresh session.
+
 ### State pollution matters as much as the code
 
 Three separate pieces of on-disk state were produced during the broken period
