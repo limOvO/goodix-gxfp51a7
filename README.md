@@ -105,19 +105,23 @@ accepted — a 1-in-256 event, which is what made the driver's own TLS test flak
 (~1 run in 30, reproducible on pristine upstream). With the check added, that
 test passes 150/150.
 
-## Speed
+## Speed — attempted, reverted
 
-Capture was measured per protocol step and retuned: **~900 ms → ~649 ms**, from a
-stuck timing multiplier and over-cautious protocol delays. What that cost, and
-what does *not* work, is worth stating.
+Capture was retuned from ~900 ms to ~649 ms (drain silence, inter-command gap, and
+a timing multiplier stuck at 150%). **All of it is reverted.**
 
-**Do not cache the background frame.** It looks like a free ~700 ms — it holds
-no fingerprint, being taken only with the finger lifted — but the sensor's
-baseline drifts within tens of seconds, so an older background distorts the
-difference image and the matcher collapses. Measured on the same enrolled
-template: **24–28 (matches, threshold 20) with a fresh background, 0–3 (never
-matches) with a cached one.** A fresh background before every operation is part
-of the measurement, not overhead.
+The retuned values were only ever checked against *background* captures. With a
+finger down the sensor answers the image request with a 0xD0 TLS-reconnect
+instead of a frame, so recognition stopped working entirely:
+
+| setting | background | finger |
+|---|---|---|
+| drain 4, gap 30 ms | works | works |
+| drain 3, gap 25 ms | works, ~1.4x faster | 0xD0, no frame |
+
+On this part the conservative timings are load bearing. The rule this produced:
+only a capture *with a finger on the sensor* validates a protocol change, since
+that path behaves differently from the background path.
 
 ## Build
 

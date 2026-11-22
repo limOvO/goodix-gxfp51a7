@@ -31,7 +31,7 @@ them required reading the sensor's own protocol off the bus.
 | Finger detection | idle mean 356 → floor 332, drop 98–125 on press |
 | Image capture | 22189-byte frame on every attempt |
 | Enrolment progress | **12 consecutive stages**, keypoints 143 → 854, extent 107×87 → 253×227 |
-| Match scores (fresh background) | 24-28 against a threshold of 20 |
+| Match scores | 24-28 against a threshold of 20 (fresh background, working build) |
 
 **What is not yet confirmed:** a completed 20-stage enrolment and a matching
 verify. Both need ~20 physical presses, which cannot be automated. The capture
@@ -217,7 +217,7 @@ pristine clone and reproduce the working source byte-for-byte.
 | Reset | use line 264; skip for 14115; read firmware before any reset |
 | Firmware detect | retry; unreadable ⇒ assume 14115 if a key is cached |
 | Cleanup | removed (the reference teardown broke the next frame) |
-| Speed | reuse cached background; fix timing-scale ratchet; retune delays |
+| Speed | attempted, reverted (see §6) |
 | TLS (`goodix_tls.c`) | validate all CBC padding bytes, not just the last |
 
 Non-driver pieces, all in the project directory:
@@ -232,56 +232,29 @@ Non-driver pieces, all in the project directory:
 
 ---
 
-## 6. Performance
+## 6. Performance — a reverted attempt
 
-Recognition felt slow, so each phase was measured rather than guessed at
-(`fp_dbg` timestamps per protocol step).
+Recognition felt slow, so capture was retuned (drain silence 4->3, inter-command
+gap 30->25 ms, and a fix for a timing multiplier that had ratcheted to 150%).
+Capture dropped from ~900 ms to ~649 ms on background frames.
 
-| | before | after |
+**It was reverted.** Those timings were only ever validated with *background*
+captures. With a finger down the sensor answers the image request with a 0xD0
+TLS-reconnect instead of a frame — so recognition stopped working entirely. The
+measurements were real; the validation was not.
+
+The honest conclusion is that on this part the conservative timings are load
+bearing, not slack:
+
+| setting | background capture | finger capture |
 |---|---|---|
-| Single capture | ~900 ms | **~649 ms** |
-| Session start | 1581 ms | ~1260 ms |
+| drain 4, gap 30 ms | works | works |
+| drain 3, gap 25 ms | works, ~1.4x faster | **0xD0, no frame** |
 
-**A caching idea that had to be reverted — and why it matters.** Reusing the
-background frame across recognitions looked like a free ~700 ms: the frame holds
-no fingerprint, because it is only ever taken with the finger lifted. It is not
-free. The sensor's baseline drifts within tens of seconds, so an older
-background yields a distorted difference image and the matcher collapses.
-
-Measured on real verifications, the same enrolled template scored:
-
-| background | scores | threshold 20 |
-|---|---|---|
-| fresh each time | 24, 26, 27, 28 | matches |
-| cached (up to 2 h) | 0, 0, 2, 3, 7 | **never matches** |
-
-That was a genuine regression I introduced, and it is why recognition stopped
-working. The behaviour is now upstream's again: a fresh background before every
-operation, with the cache used only when a finger is already down. The cache age
-was also cut from 2 h to 20 s so a stale frame cannot be picked up elsewhere.
-The upstream comment already said this ("a background captured too early ...
-collapses the score"); I should have trusted it instead of measuring only
-latency.
-
-**1. The timing scale was stuck at 150%.** A ratchet bug: a capture returning
-*zero* bytes was treated as "delays too tight" and raised the persisted
-multiplier by 50% each time. No amount of extra delay can make a missing frame
-appear — the real cause was the wrong capture recipe (§3.3), since fixed. Only a
-frame that arrives but decrypts short now counts as a timing failure, and the
-step-down is quick (3 clean sessions) so an unneeded scale cannot persist.
-
-**2. Conservative protocol delays.** Re-measured per point, 5–6 captures each:
-
-| drain silence | result |
-|---|---|
-| 4 → 3 | 724 ms → 615 ms, 6/6 reliable |
-| 2 | **0/6** — no usable frame at all |
-
-2 is a cliff rather than a degradation, so 3 is the floor. The inter-command gap
-also went from 30 ms to 25 ms (measured 6/6 at that setting, 5/6 at 15 ms, which
-is why 25 was kept rather than the fastest value).
-
-Net effect on capture: **1.4x faster**, with matching left intact.
+Reverting restored capture immediately (3/3 runs, no reconnects). The rule this
+episode produced: **a change is only validated by a capture with a finger on the
+sensor**, because that is the path verification uses and it behaves differently
+from the background path.
 
 ---
 
