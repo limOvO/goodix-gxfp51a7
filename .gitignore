@@ -25,10 +25,13 @@ __pycache__/
 *.log
 
 # NEVER commit biometric data or capture output.
-# A stitched fingerprint image was committed once by accident. These patterns
-# are the guard against a repeat: capture dumps, background frames, adaptive
-# stores, score history and any rendered image are all refused.
+# A stitched fingerprint image reached this repository once by accident: the
+# export step copies the working directory wholesale and nothing checked its
+# contents. These patterns refuse capture dumps, background frames, adaptive
+# stores, score history and any rendered image.
 *.png
+*.jpg
+*.jpeg
 *.bin
 *.bg
 *.pending

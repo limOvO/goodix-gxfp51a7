@@ -542,7 +542,52 @@ fallback for comparison; verified it still captures (599 ms, image received).
 
 ---
 
-## 12. An upstream TLS bug found on the way
+## 12. Cutting the sequence: configure once, not per press
+
+The interrupt work (§11) shaved 83 ms, which was not enough. The problem was
+structural, not tunable: **every press re-ran all five commands**, but only
+`0x20` reads the sensor. The other four — MCU state, FDT boot zones, NAV,
+background FDT baseline — configure state that persists for the TLS session.
+
+Doing that before every press was 4/5 of the sequence spent on a job already
+done. The background capture at session start is the pass that configures the
+sensor; a press afterwards only needs the image.
+
+| | before | after |
+|---|---|---|
+| sequence on a press | 376 ms | **60 ms** |
+| press → verdict | 623 ms | **298 ms** |
+| touch → verdict (incl. poll) | ~895 ms | ~570 ms |
+
+Median **298 ms** over 5 presses (295–339), 0 failures, measured with the
+compiled-in defaults rather than environment overrides. Match scores *improved*
+— 51, 90, 84, 81, 76 against a threshold of 20 — because the background is now
+captured once with the finger lifted instead of being re-settled under a
+pressing finger.
+
+The configuration is tied to the TLS session, so it is cleared whenever the
+session is torn down. If a press ever arrives before the background pass has
+run, the driver falls back to the full sequence rather than sending `0x20` to an
+unconfigured sensor.
+
+### Protocol timings re-measured
+
+With the sequence split, the per-command delays were re-swept (8–10 captures
+per point, clean timing scale):
+
+| drain misses × spacing | reply read | sequence | reliability |
+|---|---|---|---|
+| 4 × 10 ms (previous) | 5 ms | 526 ms | 10/10 |
+| **3 × 8 ms** | **4 ms** | **371 ms** | **18/18** |
+| 3 × 7 ms | 4 ms | — | 0/4 |
+| 3 × 6 ms | 4 ms | — | 0/3 |
+
+The inter-command gap also went 30 ms → 15 ms. The floor is a hard cliff — 3 ×
+7 ms fails outright rather than degrading — so these sit one step back from it.
+
+---
+
+## 13. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -571,7 +616,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 13. Verification
+## 14. Verification
 
 Repeated, measured, on the final build:
 
@@ -598,7 +643,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 14. Remaining work
+## 15. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -621,7 +666,7 @@ password always remains available as a fallback.
 
 ---
 
-## 15. Security notes
+## 16. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -637,7 +682,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 16. Provenance
+## 17. Provenance
 
 Reverse-engineering input, all public:
 

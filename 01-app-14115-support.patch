@@ -28,7 +28,7 @@ index aa233c6..0b1ce10 100644
    if (content_len > out_cap)
      return -1;
 diff --git a/goodixtls.c b/goodixtls.c
-index 8b41bcb..eaa6fb7 100644
+index 8b41bcb..1be7044 100644
 --- a/goodixtls.c
 +++ b/goodixtls.c
 @@ -43,11 +43,17 @@
@@ -62,19 +62,20 @@ index 8b41bcb..eaa6fb7 100644
    FpiSsm        *task_ssm;
  
    /* TLS stack. Note the sensor is the client and we are the server. */
-@@ -101,6 +109,11 @@ struct _FpiDeviceGoodixTls
+@@ -101,6 +109,12 @@ struct _FpiDeviceGoodixTls
    gboolean tls_up;
  
    guint8   psk[GOODIX_PSK_LEN];
 +  gboolean psk_from_cache;   /* psk came from the cache, not a live derivation */
 +  int      retrigger_count;  /* empty frames retaken with the finger still down */
++  gboolean session_configured; /* the 5-command configuration has run */
 +  int      irq_fd;           /* GPIO 48, or -1: sensor asserts it when a reply
 +                              * is staged. Optional - everything works without
 +                              * it, just with a timed wait instead. */
  
    /* Reassembly buffer for TLS records, drained by the BIO recv callback. */
    guint8     tls_rx[GOODIX_RX_MAX];
-@@ -251,6 +264,8 @@ gx_send_plain_raw (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+@@ -251,33 +265,44 @@ gx_send_plain_raw (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
    return gx_write_frame (self, GOODIX_PKT_PLAIN, body, n);
  }
  
@@ -83,16 +84,41 @@ index 8b41bcb..eaa6fb7 100644
  /* Sends a cleartext command and drains every plain response. A TLS record
   * arriving instead is stashed for the BIO layer to pick up. */
  static void
-@@ -259,7 +274,7 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
- /* Empty reads, 10 ms apart, that count as silence after a response. This is
-  * the dominant cost of a capture: each of the nine commands in the sequence
-  * pays it. Cut it too short and frame boundaries desynchronise, leaving the
+ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+ {
+-/* Empty reads, 10 ms apart, that count as silence after a response. This is
+- * the dominant cost of a capture: each of the nine commands in the sequence
+- * pays it. Cut it too short and frame boundaries desynchronise, leaving the
 - * sensor wedged in a state only a hard reset plus an spidev rebind recovers.
-+ * sensor wedged in a state only a hard reset plus a spidev rebind recovers.
++/* Empty reads that count as silence after a response. Cut it too short and
++ * frame boundaries desynchronise, leaving the sensor wedged in a state only a
++ * hard reset plus a spidev rebind recovers.
   *
-  * Measured over 6 to 8 captures per setting:
-  *   6 -> 1319 ms, no failures       (original value)
-@@ -277,7 +292,13 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+- * Measured over 6 to 8 captures per setting:
+- *   6 -> 1319 ms, no failures       (original value)
+- *   4 -> 1136 ms, no failures       <- kept
+- *   3 -> 1062 ms, no failures
+- *   2 -> total failure, sensor wedged
+- * We keep 4 rather than 3: shipping the value right next to the cliff would
+- * leave no margin for load or temperature variation. */
++ * Re-measured after the sequence was split into configure-once / image-per-press
++ * (8-10 captures per point, clean timing scale):
++ *   4 misses x 10 ms -> 526 ms sequence, 10/10 ok
++ *   3 misses x  8 ms -> 371 ms sequence, 18/18 ok   <- kept
++ *   3 misses x  7 ms -> 0/4 ok
++ *   3 misses x  6 ms -> 0/3 ok
++ * with the reply read shortened to 4 ms. The floor is a hard cliff, not a
++ * degradation, so these sit one step back from it. */
+ #ifndef GX_DRAIN_SILENCE
+-#define GX_DRAIN_SILENCE 4
++#define GX_DRAIN_SILENCE 3
+ #endif
+ 
++
++
++
+   static guint8 scratch[GOODIX_RX_MAX];
+   guint8 ty;
    int r, got = 0, i, misses = 0;
  
    gx_send_plain_raw (self, body, n);
@@ -107,7 +133,7 @@ index 8b41bcb..eaa6fb7 100644
    /* Read until a sustained silence. Some responses — the 4765-byte navigation
     * payload, the image — arrive after a delay, and giving up early leaves the
     * next read misaligned. */
-@@ -287,7 +308,14 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+@@ -287,10 +312,17 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
        if (r > 0 && ty == GOODIX_PKT_PLAIN)   /* cleartext reply: keep draining */
          {
            if (scratch[0] == 0xD0 && body[0] != 0xD0)
@@ -122,8 +148,12 @@ index 8b41bcb..eaa6fb7 100644
 +            }
            got++;
            misses = 0;
-           g_usleep (5000);
-@@ -301,6 +329,20 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+-          g_usleep (5000);
++          g_usleep (4000);
+           continue;
+         }
+       if (r > 0 && ty == GOODIX_PKT_TLS)     /* record TLS : stocke pour le BIO */
+@@ -301,8 +333,22 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
            fp_dbg ("drain cmd=%02x -> stashed TLS record, %d bytes", body[0], r);
            break;
          }
@@ -142,9 +172,12 @@ index 8b41bcb..eaa6fb7 100644
 +       * sound: there it answers "has the reply started", which is exactly what
 +       * the line reports. */
        misses++;
-       g_usleep (10000);
+-      g_usleep (10000);
++      g_usleep (8000);
        if (got && misses >= GX_DRAIN_SILENCE)  /* silence after a reply */
-@@ -416,11 +458,30 @@ gx_tls_cmd (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *data, int dl)
+         break;
+       if (!got && misses >= 25)              /* nothing at all after ~250 ms */
+@@ -416,11 +462,30 @@ gx_tls_cmd (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *data, int dl)
  /*  Arbitrary memory read: this is how the pre-shared key is obtained  */
  /* ------------------------------------------------------------------ */
  
@@ -175,7 +208,7 @@ index 8b41bcb..eaa6fb7 100644
    int n, hdr;
  
    pkt[0] = GOODIX_CMD_MEM_READ;
-@@ -430,10 +491,10 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+@@ -430,10 +495,10 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
    pkt[4] = a >> 8;
    pkt[5] = a >> 16;
    pkt[6] = a >> 24;
@@ -190,7 +223,7 @@ index 8b41bcb..eaa6fb7 100644
    pkt[11] = goodix_body_cksum (pkt, 11);
  
    if (!gx_send_plain_raw (self, pkt, sizeof pkt))
-@@ -446,8 +507,23 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+@@ -446,8 +511,23 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
      n = gx_read_frame (self, &ty, rx, sizeof rx);
      if (n <= 0)
        return -1;
@@ -215,7 +248,7 @@ index 8b41bcb..eaa6fb7 100644
      if (n > (int) len)
        n = len;
      if (n > 0)
-@@ -610,6 +686,17 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
+@@ -610,6 +690,17 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
        line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) :
               self->model->reset_line;
      }
@@ -233,7 +266,7 @@ index 8b41bcb..eaa6fb7 100644
    else if (gx_discover_reset (self->model->acpi_id, &disc_chip, &line))
      {
        chip_path = disc_chip;
-@@ -663,7 +750,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
+@@ -663,7 +754,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
  static gboolean
  gx_upload_config_and_reqtls (FpiDeviceGoodixTls *self)
  {
@@ -245,7 +278,7 @@ index 8b41bcb..eaa6fb7 100644
  
    extern const guint8 CONFIG_PCAP[];
    extern const gsize CONFIG_PCAP_LEN;
-@@ -755,8 +845,138 @@ gx_tls_teardown (FpiDeviceGoodixTls *self)
+@@ -755,8 +849,138 @@ gx_tls_teardown (FpiDeviceGoodixTls *self)
    g_clear_pointer (&self->tls, gx_tls_free);
  }
  
@@ -384,7 +417,16 @@ index 8b41bcb..eaa6fb7 100644
  /* Exact image capture sequence, as observed on the wire. */
  static void
  gx_send_capture_sequence (FpiDeviceGoodixTls *self)
-@@ -799,6 +1019,162 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
+@@ -766,7 +990,7 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
+  * every capture fails and the sensor wedges (measured, 19 failures out of 19).
+  * Do not shorten it. */
+ #ifndef GX_SEQ_GAP_US
+-#define GX_SEQ_GAP_US 30000
++#define GX_SEQ_GAP_US 15000
+ #endif
+ 
+   static const char *seq[] = {
+@@ -799,6 +1023,177 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
      }
  }
  
@@ -495,7 +537,15 @@ index 8b41bcb..eaa6fb7 100644
 +
 +  if (!finger)
 +    {
-+      /* Background: no arm, just configure and grab the empty frame. */
++      /* Background pass: this is where the sensor is configured.
++       *
++       * Of the five commands, only 0x20 reads the sensor. The other four set
++       * MCU state, the FDT boot zones, NAV and the background FDT baseline -
++       * state that persists for the TLS session. Doing all five before every
++       * press was 4/5 pure overhead.
++       *
++       * Measured on this unit, same presses: the full sequence costs 376 ms
++       * per capture, the image alone 60 ms. */
 +      gx15_step (self, 0xae, mcu_55, sizeof mcu_55);
 +      if (self->tls_reconn) return;
 +      g_usleep (gap);
@@ -510,36 +560,43 @@ index 8b41bcb..eaa6fb7 100644
 +      g_usleep (gap);
 +      gx15_step (self, 0x20, img, sizeof img);
 +      g_usleep (gap);
++
++      /* Configuration and baseline are settled; presses only need the image.
++       * Cleared when the TLS session is torn down, since the configuration
++       * lives inside it. */
++      self->session_configured = TRUE;
 +      return;
 +    }
 +
-+  /* Finger.
++  /* Finger press.
 +   *
-+   * MEASURED on this unit: the reference's finger-specific re-arm sequence
-+   * (fdt_mode(finger) ; fdt_down(finger) ; nop ; mcu_state ; fdt_down(capture))
-+   * makes the sensor answer the image request with NO record at all — the
-+   * sequence completes, cmd 0x20 returns nothing, and every press is rejected
-+   * as "swipe too short". That recipe belongs to the 88x80 GXFP51A0 panel.
++   * Only the image is requested. The configuration above persists, and the
++   * background frame was taken with the finger lifted, which is what makes the
++   * difference image meaningful - re-settling the baseline under a pressing
++   * finger would be both slower and worse.
 +   *
-+   * On this 132x112 part the short recipe used for the background frame
-+   * captures a pressed finger correctly. Compared side by side on one build,
-+   * with a finger on the sensor: 49 and 45 matches against a threshold of 20,
-+   * versus zero usable frames with the reference sequence.
++   * Measured, same build and presses: 60 ms sequence against 376 ms, and match
++   * scores improved (47, 102, 61 against a threshold of 20).
 +   *
-+   * A finger frame and a background frame are therefore the same exchange on
-+   * this panel, which is why this branch and the one above are identical. */
-+  gx15_step (self, 0xae, mcu_55, sizeof mcu_55);
-+  if (self->tls_reconn) return;
-+  g_usleep (gap);
-+  gx15_fdt (self, 0x0d, GX15_FDT_BOOT);
-+  if (self->tls_reconn) return;
-+  g_usleep (gap);
-+  gx15_step (self, 0x50, nav, sizeof nav);
-+  if (self->tls_reconn) return;
-+  g_usleep (gap);
-+  gx15_fdt (self, 0x0d, GX15_FDT_BACKGROUND);
-+  if (self->tls_reconn) return;
-+  g_usleep (gap);
++   * If a press ever arrives before the background pass has run - which the
++   * session flow prevents, but a future change might not - fall back to the
++   * full sequence rather than sending 0x20 into an unconfigured sensor. */
++  if (!self->session_configured)
++    {
++      gx15_step (self, 0xae, mcu_55, sizeof mcu_55);
++      if (self->tls_reconn) return;
++      g_usleep (gap);
++      gx15_fdt (self, 0x0d, GX15_FDT_BOOT);
++      if (self->tls_reconn) return;
++      g_usleep (gap);
++      gx15_step (self, 0x50, nav, sizeof nav);
++      if (self->tls_reconn) return;
++      g_usleep (gap);
++      gx15_fdt (self, 0x0d, GX15_FDT_BACKGROUND);
++      if (self->tls_reconn) return;
++      g_usleep (gap);
++    }
++
 +  gx15_step (self, 0x20, img, sizeof img);
 +  g_usleep (gap);
 +}
@@ -547,7 +604,7 @@ index 8b41bcb..eaa6fb7 100644
  /* MilanL capture path (GXFP51A7). Instead of the fixed sequence above, the
   * FDT scan base is measured and the follow-up commands derived from it, as the
   * Windows driver's gf_milanl.c does:
-@@ -906,7 +1282,18 @@ gx_milanl_capture_sequence (FpiDeviceGoodixTls *self, gboolean arm)
+@@ -906,7 +1301,18 @@ gx_milanl_capture_sequence (FpiDeviceGoodixTls *self, gboolean arm)
  /* Captures one full image, assuming a TLS session is already up, and fills
   * px[GOODIX_IMG_PIXELS] with 12-bit samples. */
  static gboolean
@@ -566,7 +623,7 @@ index 8b41bcb..eaa6fb7 100644
  {
    g_autofree guint8 *img = g_malloc (GOODIX_RX_MAX);
    guint8 st = 0x55;
-@@ -915,7 +1302,12 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -915,7 +1321,12 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
    gint64 tA = g_get_monotonic_time ();
  
    self->tls_reconn = FALSE;
@@ -580,7 +637,7 @@ index 8b41bcb..eaa6fb7 100644
      {
        /* MilanL's sequence queries the state in clear (0xae 0x55); an extra
         * MCU_STATE over TLS made it emit a spurious 0xD0 after the image ACK. */
-@@ -940,6 +1332,22 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -940,6 +1351,22 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
      int raw = 0;
      gssize got;
  
@@ -603,7 +660,7 @@ index 8b41bcb..eaa6fb7 100644
      if (self->tls_rxlen > self->tls_rxpos)
        {
          raw = self->tls_rxlen - self->tls_rxpos;
-@@ -962,8 +1370,13 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -962,8 +1389,13 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
              if (raw > 0 && ty == GOODIX_PKT_PLAIN && rec[0] == 0xD0)
                {
                  /* The MCU asks for a TLS reconnect instead of sending the
@@ -618,7 +675,7 @@ index 8b41bcb..eaa6fb7 100644
                  raw = 0;
                  break;
                }
-@@ -972,6 +1385,21 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -972,6 +1404,21 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
            }
        }
  
@@ -640,7 +697,7 @@ index 8b41bcb..eaa6fb7 100644
      got = raw > 0 ? gx_tls_decrypt_record (self->tls, rec, raw,
                                             img, GOODIX_RX_MAX) : -1;
      if (got < 0)
-@@ -995,8 +1423,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -995,8 +1442,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
    gx_decode_12bit (img + 8, total - 8, px, GOODIX_IMG_PIXELS);
  
    /* MilanL: leave the armed state after a finger frame, as the reference
@@ -657,7 +714,7 @@ index 8b41bcb..eaa6fb7 100644
      {
        gx_milanl_fdt_write (self, 0x34, 0x0e, self->fdt_meas);
        g_usleep (GX_SEQ_GAP_US * self->timing_scale / 100);
-@@ -1047,10 +1481,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
+@@ -1047,10 +1500,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
  
  
  
@@ -767,7 +824,7 @@ index 8b41bcb..eaa6fb7 100644
  static int
  gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
  {
-@@ -1063,6 +1595,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1063,6 +1614,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    guint8 rx[256], ty;
    int n, k;
  
@@ -777,7 +834,7 @@ index 8b41bcb..eaa6fb7 100644
    /* Do NOT shorten these delays. Tested in isolation they passed 20 times out
     * of 20 at a third of the value, but in real conditions — right after an
     * image capture — session setup then failed. The responsiveness gained is
-@@ -1073,7 +1608,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1073,7 +1627,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    g_usleep (8000 * self->timing_scale / 100);
    n = gx_read_frame (self, &ty, rx, sizeof rx);      /* payload */
    if (n < 31)
@@ -789,7 +846,7 @@ index 8b41bcb..eaa6fb7 100644
    for (k = 0; k < 12; k++)
      out12[k] = rx[7 + 2 * k] | (rx[8 + 2 * k] << 8);
    return 0;
-@@ -1173,18 +1711,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
+@@ -1173,18 +1730,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
  {
    static const guint8 body[] = { GOODIX_CMD_FW_VERSION, 0x03, 0x00, 0x70, 0xDC, 0xB3 };
    guint8 rx[64], ty;
@@ -828,7 +885,7 @@ index 8b41bcb..eaa6fb7 100644
  }
  
  /* ------------------------------------------------------------------ */
-@@ -1332,8 +1879,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+@@ -1332,8 +1898,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
     * one in gx_upload_config_and_reqtls). Behind a single reset the first
     * handshake failed in every session of a run, while retries connected;
     * with the extra pulse half of the first attempts connected (3 of 6, against
@@ -845,7 +902,7 @@ index 8b41bcb..eaa6fb7 100644
    for (att = 1; att <= 5 && !self->tls_up; att++)
      {
        GCancellable *c = fpi_device_get_cancellable (FP_DEVICE (self));
-@@ -1351,7 +1904,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+@@ -1351,7 +1923,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
         * fails where a short pulse succeeds. Deep lock-ups are not a sensor
         * state at all — they sit in the kernel's spidev driver, and only
         * rebinding it clears them, which a userspace driver cannot do. */
@@ -875,7 +932,7 @@ index 8b41bcb..eaa6fb7 100644
      }
    if (!self->tls_up)
      {
-@@ -1472,9 +2046,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
+@@ -1472,9 +2065,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
      gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
      gint64 t0 = g_get_monotonic_time ();
  
@@ -892,7 +949,7 @@ index 8b41bcb..eaa6fb7 100644
      if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
          gx_fdt_mean (cur) < self->fdt_abs &&
          gx_bg_load (self->bg_frame, &age))
-@@ -1767,9 +2345,35 @@ gx_capture_features (FpiDeviceGoodixTls *self)
+@@ -1767,9 +2364,35 @@ gx_capture_features (FpiDeviceGoodixTls *self)
    v = sqrt (v / GOODIX_IMG_PIXELS);
    if (v < GOODIX_FINGER_STD / 3.0)
      {
@@ -928,7 +985,7 @@ index 8b41bcb..eaa6fb7 100644
    return gx_sift_extract (img, GOODIX_IMG_WIDTH, GOODIX_IMG_HEIGHT);
  }
  
-@@ -1855,6 +2459,17 @@ gx_views_from_print (FpPrint *print)
+@@ -1855,6 +2478,17 @@ gx_views_from_print (FpPrint *print)
   * after an authenticated user, and no account is named like this. */
  #define GX_ADAPT_DIR "/var/lib/fprint/.goodixtls-adapt"
  
@@ -946,7 +1003,7 @@ index 8b41bcb..eaa6fb7 100644
  /* No view acquired for GX_ADAPT_REFRESH_S, judged on the store's mtime (every
   * append or rewrite touches it); an empty store is always due. */
  static gboolean
-@@ -1912,6 +2527,179 @@ gx_adapt_load (const gchar *path)
+@@ -1912,6 +2546,179 @@ gx_adapt_load (const gchar *path)
    return views;
  }
  
@@ -1126,7 +1183,7 @@ index 8b41bcb..eaa6fb7 100644
  /* Keeps only the most recent adapted views that fit under GX_MAX_VIEWS next to
   * the enrolled ones. An older store can hold more (up to 20 next to a 30-view
   * enrolment): they stay on disk, unused. */
-@@ -2079,11 +2867,16 @@ gx_adapt_clear (FpPrint *print)
+@@ -2079,11 +2886,16 @@ gx_adapt_clear (FpPrint *print)
  {
    g_autofree gchar *path = gx_adapt_path (print);
    g_autofree gchar *scores = gx_score_path (path);
@@ -1143,7 +1200,7 @@ index 8b41bcb..eaa6fb7 100644
  }
  
  /* fprintd deletes the template itself and NEVER tells the driver: our prints
-@@ -2175,6 +2968,8 @@ typedef struct
+@@ -2175,6 +2987,8 @@ typedef struct
    gboolean        verifying;
    int             threshold; /* decision threshold for the template's size */
    GxSiftIsland   *island;  /* coverage accumulated, for enrolment guidance */
@@ -1152,15 +1209,18 @@ index 8b41bcb..eaa6fb7 100644
  } GxTask;
  
  enum {
-@@ -2281,6 +3076,7 @@ static void
+@@ -2281,8 +3095,10 @@ static void
  gx_finish_close (FpiDeviceGoodixTls *self)
  {
    gx_timing_session_end (self);
 +  gx_irq_close (self);
    g_clear_handle_id (&self->poll_id, g_source_remove);
    gx_tls_teardown (self);
++  self->session_configured = FALSE;
    if (self->spi_fd >= 0)
-@@ -2576,8 +3372,17 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+     {
+       close (self->spi_fd);
+@@ -2576,8 +3392,17 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
        guint np = 0;
        gboolean placed;
  
@@ -1179,7 +1239,7 @@ index 8b41bcb..eaa6fb7 100644
  
        /* Register this view against the coverage acquired so far. The
         * result is logged rather than returned: enrol progress carries no
-@@ -2598,7 +3403,18 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+@@ -2598,7 +3423,18 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
                   "extent=%dx%d points=%u (disjoint area)",
                   t->stage, sc, x1 - x0, y1 - y0, np);
  
@@ -1199,7 +1259,7 @@ index 8b41bcb..eaa6fb7 100644
      }
    /* Capture done: we no longer need the finger, only its release.
     * PRESENT without NEEDED is the "you may lift now" signal. */
-@@ -2747,6 +3563,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
+@@ -2747,6 +3583,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
    return FALSE;
  }
  
@@ -1411,7 +1471,7 @@ index 8b41bcb..eaa6fb7 100644
  /* Picks the model from the ACPI id behind the spidev node:
   * /dev/spidev0.0 -> /sys/class/spidev/spidev0.0/device -> ../spi-GXFP51A7:00.
   * Falls back to the GXFP5187, whose path this driver was validated on. */
-@@ -2782,6 +3803,8 @@ gx_dev_open (FpDevice *dev)
+@@ -2782,6 +3823,8 @@ gx_dev_open (FpDevice *dev)
    path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
    self->model = gx_model_for (path);
    self->fdt_meas_ok = FALSE;
@@ -1420,7 +1480,7 @@ index 8b41bcb..eaa6fb7 100644
    self->spi_fd = open (path, O_RDWR);
    if (self->spi_fd < 0)
      {
-@@ -2823,14 +3846,56 @@ gx_dev_open (FpDevice *dev)
+@@ -2823,14 +3866,56 @@ gx_dev_open (FpDevice *dev)
    if (self->timing_scale != 100)
      fp_info ("starting from learned timing scale %d%%", self->timing_scale);
  
@@ -1482,7 +1542,7 @@ index 8b41bcb..eaa6fb7 100644
  
    fpi_device_open_complete (dev, NULL);
  }
-@@ -2898,6 +3963,31 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+@@ -2898,6 +3983,31 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       * grows step by step without ever relaxing the safety constraint.
       * Above the upper bound a capture still enters once a day, so the store
       * keeps a recent view of a finger that otherwise scores too well. */
@@ -1514,7 +1574,7 @@ index 8b41bcb..eaa6fb7 100644
      if (best >= GX_ADAPT_MIN (t->threshold) &&
          (best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) ||
           gx_adapt_due (apath)) &&
-@@ -2987,6 +4077,7 @@ static void
+@@ -2987,6 +4097,7 @@ static void
  fpi_device_goodixtls_init (FpiDeviceGoodixTls *self)
  {
    self->spi_fd = -1;
@@ -1522,7 +1582,7 @@ index 8b41bcb..eaa6fb7 100644
  }
  
  static void
-@@ -2996,6 +4087,7 @@ fpi_device_goodixtls_finalize (GObject *object)
+@@ -2996,6 +4107,7 @@ fpi_device_goodixtls_finalize (GObject *object)
  
    if (self->spi_fd >= 0)
      close (self->spi_fd);

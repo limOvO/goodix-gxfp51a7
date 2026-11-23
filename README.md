@@ -215,41 +215,44 @@ could never fire.)
 
 ## Latency
 
-Measured from the driver's own timestamps (`diagnostics/fingerprint-latency.py`):
+**press → verdict: 298 ms** — median of 5 presses, range 295–339, measured with
+the compiled-in defaults (no environment overrides). Add the detection poll and
+touch-to-verdict is about **0.57 s**.
 
 | phase | time | share |
 |---|---|---|
-| capture sequence (5 protocol commands) | 524 ms | 71% |
-| image reception + TLS decryption | 124 ms | 17% |
-| descriptor matching + decision | 89 ms | 11% |
-| **press → verdict** | **737 ms** | |
+| capture sequence (image request only) | 60 ms | 20% |
+| image reception + TLS decryption | 144 ms | 48% |
+| descriptor matching + decision | 94 ms | 32% |
 
-Plus the detection poll: the driver only notices a press on its next finger
-probe, ~545 ms apart, so add 0–545 ms (avg ~272 ms).
+### Two changes got it here
 
-**Typical touch-to-verdict: ~1.0 s.**
+**1. Wait on the reply-ready interrupt.** The sensor raises GPIO 48 when a reply
+is staged; the driver waits on it instead of sleeping a fixed 15 ms. Verified on
+hardware first — asserted 8/8, 5.8 ms IRQ-driven against 35 ms timed.
 
-### The reply-ready interrupt
-
-The sensor raises GPIO 48 when a reply is staged; the driver waits on it rather
-than sleeping a fixed 15 ms and hoping. Verified on this hardware first: the line
-asserted 8/8, and an IRQ-driven exchange took 5.8 ms against 35 ms timed. Effect:
+**2. Configure once per session, not per press.** This was the structural one.
+All five commands used to run before every press, but only `0x20` reads the
+sensor — the rest set state that persists for the session. The background
+capture at session start configures the sensor; a press only asks for the image.
 
 | | before | after |
 |---|---|---|
-| capture sequence | 607 ms | **524 ms** |
-| press → verdict | 820 ms | **737 ms** |
+| sequence on a press | 376 ms | **60 ms** |
+| press → verdict | 623 ms | **298 ms** |
 
-83 ms per recognition, 14%, 5/5 captures with no failures.
+Match scores improved too (51, 90, 84, 81, 76 against a threshold of 20): the
+background is captured once with the finger lifted instead of re-settled under a
+pressing finger.
 
-**What does not work here:** also using the line to decide the reply has
-*finished*. A 3 ms quiet window is shorter than the sensor's inter-frame gap, so
-the drain returns mid-reply and the next command collides with it — 0/5 frames.
-The timed misses measure silence, which is what the protocol requires; the line
-answers "has it started", not "is it over".
+Protocol delays were re-swept afterwards: drain 3 × 8 ms, reply read 4 ms,
+inter-command gap 15 ms. One step faster than that fails outright rather than
+degrading, so the values sit back from the cliff.
 
-The line is optional. If it cannot be claimed, the driver falls back to the
-timed path. `GOODIXTLS_NO_IRQ=1` forces the fallback.
+**Does not work:** also using the interrupt to decide the reply has *finished*.
+A short quiet window is shorter than the sensor's inter-frame gap, the drain
+returns mid-reply, and the next command collides with it — 0/5 frames. The
+timed misses measure silence, which is what the protocol requires.
 
 ## If recognition gets worse after a driver change
 
