@@ -213,6 +213,27 @@ Same-area pairs span 0.38–0.73, unrelated ones 0.00–0.24 — the boundary si
 the gap. (The first value tried, 0.85, was above every real same-area pair and
 could never fire.)
 
+## Latency
+
+Measured from the driver's own timestamps, median over 4 presses — see
+`diagnostics/fingerprint-latency.py`:
+
+| phase | time | share |
+|---|---|---|
+| capture sequence (5 protocol commands) | 607 ms | 74% |
+| image reception + TLS decryption | 124 ms | 15% |
+| descriptor matching + decision | 89 ms | 11% |
+| **press → verdict** | **820 ms** | |
+
+Plus the detection poll: the driver only notices a press on its next finger
+probe, ~545 ms apart, so add 0–545 ms (avg ~272 ms).
+
+**Typical touch-to-verdict: ~1.1 s.**
+
+Worth knowing: the matching is only 89 ms — the software side is not the
+bottleneck. Three quarters is the protocol exchange, and those delays are
+load-bearing (drain 2 wedges the sensor outright).
+
 ## If recognition gets worse after a driver change
 
 Clear the on-disk state produced while it was broken — it drags scores down

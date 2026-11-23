@@ -449,7 +449,46 @@ stores are only as protected as the filesystem. They are written `0600`.
 
 ---
 
-## 10. An upstream TLS bug found on the way
+## 10. Press-to-verdict latency
+
+Measured from the driver's own timestamps over 4 presses, not estimated
+(`diagnostics/fingerprint-latency.py`):
+
+| press | capture sequence | image reception | scoring | total | score |
+|---|---|---|---|---|---|
+| 1 | 604 ms | 125 ms | 86 ms | **815 ms** | 36 |
+| 2 | 602 ms | 122 ms | 90 ms | **814 ms** | 30 |
+| 3 | 610 ms | 124 ms | 90 ms | **824 ms** | 10 |
+| 4 | 611 ms | 124 ms | 90 ms | **825 ms** | 17 |
+
+Median **820 ms** from the moment the driver acts on the press to the match
+decision, with a spread of only 11 ms across presses.
+
+Where it goes:
+
+| phase | time | share |
+|---|---|---|
+| capture sequence (5 protocol commands) | 607 ms | 74% |
+| image reception and TLS decryption | 124 ms | 15% |
+| descriptor matching and decision | 89 ms | 11% |
+
+The matching itself — the part that would be worth optimising in software — is
+only **89 ms**. Three quarters is the protocol exchange with the sensor.
+
+**Add the detection poll.** The driver cannot see a press until its next finger
+probe, and each probe is itself a protocol exchange, so probes land ~545 ms
+apart (up to 1250 ms when the loop is between states). A press therefore waits
+0-545 ms just to be noticed, averaging ~272 ms:
+
+> **Typical touch-to-verdict: ~1.1 s** (820 ms path + ~270 ms poll wait)
+
+The drains and gaps that dominate cannot simply be shortened: measured earlier,
+drain 2 wedges the sensor outright, and drain 3 works for background frames but
+not for a pressed finger. This is close to the floor for this part.
+
+---
+
+## 11. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -478,7 +517,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 11. Verification
+## 12. Verification
 
 Repeated, measured, on the final build:
 
@@ -505,7 +544,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 12. Remaining work
+## 13. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -528,7 +567,7 @@ password always remains available as a fallback.
 
 ---
 
-## 13. Security notes
+## 14. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -544,7 +583,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 14. Provenance
+## 15. Provenance
 
 Reverse-engineering input, all public:
 
