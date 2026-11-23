@@ -223,6 +223,8 @@ pristine clone and reproduce the working source byte-for-byte.
 | Cleanup | removed (the reference teardown broke the next frame) |
 | Speed | attempted, reverted (see §6) |
 | Capture recipe | short recipe for both frames; reference re-arm does not work here (§7) |
+| Duplicate presses | recorded but not counted during enrolment (§9) |
+| New areas | pending until seen twice, then added (§9) |
 | 0xD0 handling | reconnect the TLS session and retry once |
 | TLS (`goodix_tls.c`) | validate all CBC padding bytes, not just the last |
 
@@ -391,7 +393,63 @@ there is no code change that recovers a third of a fingerprint.
 
 ---
 
-## 9. An upstream TLS bug found on the way
+## 9. Learning new areas, without letting a bad press in
+
+Two behaviours were added so the template can grow from ordinary use while
+staying trustworthy.
+
+### During enrolment: a duplicate is recorded, but does not count
+
+Pressing the same spot again cannot improve coverage, so the driver measures how
+much of each press the views collected so far already explain. Above
+`GX_DUPLICATE_FRAC` the press is **kept** — its descriptors still contribute to
+the fused template — but it does not consume a stage, and the user is asked to
+shift to a new area.
+
+The threshold is measured, not guessed, using the driver's own fusion matcher:
+
+| pair | content correlation | fraction already covered |
+|---|---|---|
+| p015 / p016 | 0.993 | 0.73 |
+| p002 / p003 | 0.676 | 0.57 |
+| p012 / p014 | 0.584 | 0.45 |
+| p008 / p009 | 0.513 | 0.39 |
+| p005 / p006 | 0.629 | 0.38 |
+| p001 / p002 | 0.275 | 0.24 |
+| p001 / p008 | 0.106 | 0.00 |
+
+Same-area pairs span 0.38–0.73, unrelated ones 0.00–0.24, so the boundary sits
+at **0.33**. The first value tried was 0.85, which is above every real
+same-area pair — it could never fire, and only measurement showed that.
+
+### Outside enrolment: a new area needs a second sighting
+
+A verify that fails is normally just a failed attempt. But a score in the band
+between `0.45 × threshold` and the threshold means *the same finger, an area the
+template does not cover* — the ridges agree, just not enough to authenticate.
+
+Such a capture is **not** added immediately. It is written to a `.pending` store
+next to the adaptive one. When the same area appears again — the new capture
+matching the pending one — the pair is promoted into the template's store. One
+unrecognised press could be a bad press, a smear or another finger; two
+independent presses agreeing on ridges the template lacks is much stronger
+evidence.
+
+Re-enrolling clears the pending store: its entries were "areas the old template
+does not cover", which is void once the template is replaced.
+
+Verified on hardware with 8 presses (4 centre, 4 edge): the `.pending` file
+appeared and the `.views` store was **not** written to, i.e. the first sighting
+of each new area was recorded without being trusted. A separate check on
+recorded pairs confirms the promotion threshold separates the populations — the
+same-area pairs in the table above all clear it, the unrelated ones do not.
+
+Safety note, unchanged by any of this: matching runs on the host, so these
+stores are only as protected as the filesystem. They are written `0600`.
+
+---
+
+## 10. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -420,7 +478,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 10. Verification
+## 11. Verification
 
 Repeated, measured, on the final build:
 
@@ -447,7 +505,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 11. Remaining work
+## 12. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -470,7 +528,7 @@ password always remains available as a fallback.
 
 ---
 
-## 12. Security notes
+## 13. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -486,7 +544,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 13. Provenance
+## 14. Provenance
 
 Reverse-engineering input, all public:
 

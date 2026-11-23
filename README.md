@@ -181,6 +181,38 @@ Rotation was tested rather than assumed: rotating a failing capture through
 A failing press is not centred on the pad. There is no code fix for a third of
 a fingerprint — press with the pad under the centre of the fingertip.
 
+## Growing the template during normal use
+
+Two rules, both driven by measurement rather than assumption.
+
+**During enrolment, a duplicate press is recorded but does not count.** The
+driver measures how much of each press the collected views already explain.
+Above 0.33 the press is kept — its descriptors still enrich the fused template —
+but no stage is consumed, and you are asked to shift to a new area.
+
+**Outside enrolment, a new area needs a second sighting.** A verify scoring
+between `0.45 × threshold` and the threshold is "same finger, an area the
+template does not cover": the ridges agree, just not enough to authenticate.
+Such a capture goes to a `.pending` store rather than the template. Only when the
+same area appears again is it added — one stray press cannot write itself into
+the biometric record.
+
+Measured separation for the 0.33 boundary (content correlation → fraction
+already covered):
+
+| correlation | covered | verdict |
+|---|---|---|
+| 0.993 | 0.73 | same area |
+| 0.676 | 0.57 | same area |
+| 0.584 | 0.45 | same area |
+| 0.513 | 0.39 | same area |
+| 0.275 | 0.24 | different area |
+| 0.106 | 0.00 | different area |
+
+Same-area pairs span 0.38–0.73, unrelated ones 0.00–0.24 — the boundary sits in
+the gap. (The first value tried, 0.85, was above every real same-area pair and
+could never fire.)
+
 ## If recognition gets worse after a driver change
 
 Clear the on-disk state produced while it was broken — it drags scores down

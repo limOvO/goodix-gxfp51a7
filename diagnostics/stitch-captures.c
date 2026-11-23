@@ -648,10 +648,36 @@ main (int argc, char **argv)
 
       for (int e = 0; e < ne; e++)
         {
-          int i = edges_sorted[e].a, j = edges_sorted[e].b;
+          int ea = edges_sorted[e].a, eb = edges_sorted[e].b;
+          int i, j;
+          Transform t = best[ea * nview + eb];
+          gboolean forward = TRUE;
 
-          if (!v[i].placed || v[j].placed)
+          if (v[ea].placed && !v[eb].placed)
+            { i = ea; j = eb; }
+          else if (v[eb].placed && !v[ea].placed)
+            {
+              /* Walk the edge backwards: swap ends and invert the transform
+               * (p_B = R p_A + t  =>  p_A = R(-th)(p_B - t)). Edges are stored
+               * once per unordered pair, so without this a chain is only ever
+               * traversed one way and the layout splits into components that
+               * are connected in reality. */
+              Transform inv;
+              double ct = cos (-t.th), st = sin (-t.th);
+
+              inv.th = -t.th;
+              inv.tx = -(ct * t.tx - st * t.ty);
+              inv.ty = -(st * t.tx + ct * t.ty);
+              inv.inliers = t.inliers;
+              inv.a = t.a;
+              inv.b = t.b;
+              t = inv;
+              i = eb; j = ea;
+              forward = FALSE;
+            }
+          else
             continue;
+          (void) forward;
 
           /* Compose the pair transform into the global frame.
            *
@@ -670,7 +696,6 @@ main (int argc, char **argv)
            * genuine pair rotations (-3 to -21 deg) still produced a radially
            * smeared stitch: every hop accumulated the rotation instead of
            * cancelling it. */
-          Transform t = best[i * nview + j];
           double qx = IW / 2.0, qy = IH / 2.0;
 
           v[j].gth = v[i].gth - t.th;
