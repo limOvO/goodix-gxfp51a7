@@ -246,7 +246,7 @@ index aa233c6..0b1ce10 100644
    if (content_len > out_cap)
      return -1;
 diff --git a/goodixtls.c b/goodixtls.c
-index 8b41bcb..1be7044 100644
+index 8b41bcb..a31582d 100644
 --- a/goodixtls.c
 +++ b/goodixtls.c
 @@ -43,11 +43,17 @@
@@ -293,7 +293,30 @@ index 8b41bcb..1be7044 100644
  
    /* Reassembly buffer for TLS records, drained by the BIO recv callback. */
    guint8     tls_rx[GOODIX_RX_MAX];
-@@ -251,33 +265,44 @@ gx_send_plain_raw (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+@@ -122,6 +136,22 @@ struct _FpiDeviceGoodixTls
+   gboolean   worker_active;   /* a work thread is running; close must wait */
+   gboolean   close_pending;   /* close was asked while a worker ran; do it after */
+   gboolean   bg_dirty;       /* background taken with a finger down */
++
++  /* One physical press must count as one sighting, however many verification
++   * operations it spans.
++   *
++   * pam_fprintd retries up to max-tries times, and each retry is a separate
++   * verify: a fresh TLS session, a fresh capture, a fresh pending decision. A
++   * finger left resting on the pad while the retries run is therefore the same
++   * press seen N times, and the stores must not treat that as N independent
++   * confirmations of an area.
++   *
++   * The generation number identifies the press. It is bumped in gx_poll_on,
++   * from the first detection poll, because that is the earliest moment the
++   * sensor reports the pad's real state - see the note there. */
++  guint      press_generation;
++  guint      adapt_generation; /* generation of the last adaptive-store append,
++                                * so one held press contributes one view */
+ };
+ 
+ G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls, fpi_device_goodixtls, FPI,
+@@ -251,33 +281,44 @@ gx_send_plain_raw (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
    return gx_write_frame (self, GOODIX_PKT_PLAIN, body, n);
  }
  
@@ -351,7 +374,7 @@ index 8b41bcb..1be7044 100644
    /* Read until a sustained silence. Some responses — the 4765-byte navigation
     * payload, the image — arrive after a delay, and giving up early leaves the
     * next read misaligned. */
-@@ -287,10 +312,17 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+@@ -287,10 +328,17 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
        if (r > 0 && ty == GOODIX_PKT_PLAIN)   /* cleartext reply: keep draining */
          {
            if (scratch[0] == 0xD0 && body[0] != 0xD0)
@@ -371,7 +394,7 @@ index 8b41bcb..1be7044 100644
            continue;
          }
        if (r > 0 && ty == GOODIX_PKT_TLS)     /* record TLS : stocke pour le BIO */
-@@ -301,8 +333,22 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
+@@ -301,8 +349,22 @@ gx_send_plain_drain (FpiDeviceGoodixTls *self, const guint8 *body, gsize n)
            fp_dbg ("drain cmd=%02x -> stashed TLS record, %d bytes", body[0], r);
            break;
          }
@@ -395,7 +418,7 @@ index 8b41bcb..1be7044 100644
        if (got && misses >= GX_DRAIN_SILENCE)  /* silence after a reply */
          break;
        if (!got && misses >= 25)              /* nothing at all after ~250 ms */
-@@ -416,11 +462,30 @@ gx_tls_cmd (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *data, int dl)
+@@ -416,11 +478,30 @@ gx_tls_cmd (FpiDeviceGoodixTls *self, guint8 cmd, const guint8 *data, int dl)
  /*  Arbitrary memory read: this is how the pre-shared key is obtained  */
  /* ------------------------------------------------------------------ */
  
@@ -426,7 +449,7 @@ index 8b41bcb..1be7044 100644
    int n, hdr;
  
    pkt[0] = GOODIX_CMD_MEM_READ;
-@@ -430,10 +495,10 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+@@ -430,10 +511,10 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
    pkt[4] = a >> 8;
    pkt[5] = a >> 16;
    pkt[6] = a >> 24;
@@ -441,7 +464,7 @@ index 8b41bcb..1be7044 100644
    pkt[11] = goodix_body_cksum (pkt, 11);
  
    if (!gx_send_plain_raw (self, pkt, sizeof pkt))
-@@ -446,8 +511,23 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
+@@ -446,8 +527,23 @@ gx_mem_read (FpiDeviceGoodixTls *self, guint32 mem, guint32 len, guint8 *out)
      n = gx_read_frame (self, &ty, rx, sizeof rx);
      if (n <= 0)
        return -1;
@@ -466,7 +489,7 @@ index 8b41bcb..1be7044 100644
      if (n > (int) len)
        n = len;
      if (n > 0)
-@@ -610,6 +690,17 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
+@@ -610,6 +706,17 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
        line = line_env ? (guint) g_ascii_strtoull (line_env, NULL, 10) :
               self->model->reset_line;
      }
@@ -484,7 +507,7 @@ index 8b41bcb..1be7044 100644
    else if (gx_discover_reset (self->model->acpi_id, &disc_chip, &line))
      {
        chip_path = disc_chip;
-@@ -663,7 +754,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
+@@ -663,7 +770,10 @@ gx_gpio_reset (FpiDeviceGoodixTls *self)
  static gboolean
  gx_upload_config_and_reqtls (FpiDeviceGoodixTls *self)
  {
@@ -496,7 +519,7 @@ index 8b41bcb..1be7044 100644
  
    extern const guint8 CONFIG_PCAP[];
    extern const gsize CONFIG_PCAP_LEN;
-@@ -755,8 +849,138 @@ gx_tls_teardown (FpiDeviceGoodixTls *self)
+@@ -755,8 +865,138 @@ gx_tls_teardown (FpiDeviceGoodixTls *self)
    g_clear_pointer (&self->tls, gx_tls_free);
  }
  
@@ -635,7 +658,7 @@ index 8b41bcb..1be7044 100644
  /* Exact image capture sequence, as observed on the wire. */
  static void
  gx_send_capture_sequence (FpiDeviceGoodixTls *self)
-@@ -766,7 +990,7 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
+@@ -766,7 +1006,7 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
   * every capture fails and the sensor wedges (measured, 19 failures out of 19).
   * Do not shorten it. */
  #ifndef GX_SEQ_GAP_US
@@ -644,7 +667,7 @@ index 8b41bcb..1be7044 100644
  #endif
  
    static const char *seq[] = {
-@@ -799,6 +1023,177 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
+@@ -799,6 +1039,177 @@ gx_send_capture_sequence (FpiDeviceGoodixTls *self)
      }
  }
  
@@ -822,7 +845,7 @@ index 8b41bcb..1be7044 100644
  /* MilanL capture path (GXFP51A7). Instead of the fixed sequence above, the
   * FDT scan base is measured and the follow-up commands derived from it, as the
   * Windows driver's gf_milanl.c does:
-@@ -906,7 +1301,18 @@ gx_milanl_capture_sequence (FpiDeviceGoodixTls *self, gboolean arm)
+@@ -906,7 +1317,18 @@ gx_milanl_capture_sequence (FpiDeviceGoodixTls *self, gboolean arm)
  /* Captures one full image, assuming a TLS session is already up, and fills
   * px[GOODIX_IMG_PIXELS] with 12-bit samples. */
  static gboolean
@@ -841,7 +864,7 @@ index 8b41bcb..1be7044 100644
  {
    g_autofree guint8 *img = g_malloc (GOODIX_RX_MAX);
    guint8 st = 0x55;
-@@ -915,7 +1321,12 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -915,7 +1337,12 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
    gint64 tA = g_get_monotonic_time ();
  
    self->tls_reconn = FALSE;
@@ -855,7 +878,7 @@ index 8b41bcb..1be7044 100644
      {
        /* MilanL's sequence queries the state in clear (0xae 0x55); an extra
         * MCU_STATE over TLS made it emit a spurious 0xD0 after the image ACK. */
-@@ -940,6 +1351,22 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -940,6 +1367,22 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
      int raw = 0;
      gssize got;
  
@@ -878,7 +901,7 @@ index 8b41bcb..1be7044 100644
      if (self->tls_rxlen > self->tls_rxpos)
        {
          raw = self->tls_rxlen - self->tls_rxpos;
-@@ -962,8 +1389,13 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -962,8 +1405,13 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
              if (raw > 0 && ty == GOODIX_PKT_PLAIN && rec[0] == 0xD0)
                {
                  /* The MCU asks for a TLS reconnect instead of sending the
@@ -893,7 +916,7 @@ index 8b41bcb..1be7044 100644
                  raw = 0;
                  break;
                }
-@@ -972,6 +1404,21 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -972,6 +1420,21 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
            }
        }
  
@@ -915,7 +938,7 @@ index 8b41bcb..1be7044 100644
      got = raw > 0 ? gx_tls_decrypt_record (self->tls, rec, raw,
                                             img, GOODIX_RX_MAX) : -1;
      if (got < 0)
-@@ -995,8 +1442,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
+@@ -995,8 +1458,14 @@ gx_capture_frame (FpiDeviceGoodixTls *self, guint16 *px, gboolean arm)
    gx_decode_12bit (img + 8, total - 8, px, GOODIX_IMG_PIXELS);
  
    /* MilanL: leave the armed state after a finger frame, as the reference
@@ -932,7 +955,7 @@ index 8b41bcb..1be7044 100644
      {
        gx_milanl_fdt_write (self, 0x34, 0x0e, self->fdt_meas);
        g_usleep (GX_SEQ_GAP_US * self->timing_scale / 100);
-@@ -1047,10 +1500,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
+@@ -1047,10 +1516,108 @@ gx_capture_avg (FpiDeviceGoodixTls *self, int nframes, guint16 *avg)
  
  
  
@@ -1042,7 +1065,7 @@ index 8b41bcb..1be7044 100644
  static int
  gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
  {
-@@ -1063,6 +1614,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1063,6 +1630,9 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    guint8 rx[256], ty;
    int n, k;
  
@@ -1052,7 +1075,7 @@ index 8b41bcb..1be7044 100644
    /* Do NOT shorten these delays. Tested in isolation they passed 20 times out
     * of 20 at a third of the value, but in real conditions — right after an
     * image capture — session setup then failed. The responsiveness gained is
-@@ -1073,7 +1627,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
+@@ -1073,7 +1643,10 @@ gx_fdt_probe (FpiDeviceGoodixTls *self, int *out12)
    g_usleep (8000 * self->timing_scale / 100);
    n = gx_read_frame (self, &ty, rx, sizeof rx);      /* payload */
    if (n < 31)
@@ -1064,7 +1087,7 @@ index 8b41bcb..1be7044 100644
    for (k = 0; k < 12; k++)
      out12[k] = rx[7 + 2 * k] | (rx[8 + 2 * k] << 8);
    return 0;
-@@ -1173,18 +1730,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
+@@ -1173,18 +1746,27 @@ gx_read_fw_version (FpiDeviceGoodixTls *self, gchar *out, gsize cap)
  {
    static const guint8 body[] = { GOODIX_CMD_FW_VERSION, 0x03, 0x00, 0x70, 0xDC, 0xB3 };
    guint8 rx[64], ty;
@@ -1103,7 +1126,7 @@ index 8b41bcb..1be7044 100644
  }
  
  /* ------------------------------------------------------------------ */
-@@ -1332,8 +1898,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+@@ -1332,8 +1914,14 @@ gx_tls_session (FpiDeviceGoodixTls *self)
     * one in gx_upload_config_and_reqtls). Behind a single reset the first
     * handshake failed in every session of a run, while retries connected;
     * with the extra pulse half of the first attempts connected (3 of 6, against
@@ -1120,7 +1143,7 @@ index 8b41bcb..1be7044 100644
    for (att = 1; att <= 5 && !self->tls_up; att++)
      {
        GCancellable *c = fpi_device_get_cancellable (FP_DEVICE (self));
-@@ -1351,7 +1923,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
+@@ -1351,7 +1939,28 @@ gx_tls_session (FpiDeviceGoodixTls *self)
         * fails where a short pulse succeeds. Deep lock-ups are not a sensor
         * state at all — they sit in the kernel's spidev driver, and only
         * rebinding it clears them, which a userspace driver cannot do. */
@@ -1150,7 +1173,7 @@ index 8b41bcb..1be7044 100644
      }
    if (!self->tls_up)
      {
-@@ -1472,9 +2065,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
+@@ -1472,9 +2081,13 @@ gx_session_start (FpiDeviceGoodixTls *self)
      gboolean timeout = FALSE, reused = FALSE, down_at_start, retaken = FALSE;
      gint64 t0 = g_get_monotonic_time ();
  
@@ -1167,7 +1190,7 @@ index 8b41bcb..1be7044 100644
      if (self->fdt_known && gx_fdt_probe (self, cur) == 0 &&
          gx_fdt_mean (cur) < self->fdt_abs &&
          gx_bg_load (self->bg_frame, &age))
-@@ -1767,9 +2364,35 @@ gx_capture_features (FpiDeviceGoodixTls *self)
+@@ -1767,9 +2380,35 @@ gx_capture_features (FpiDeviceGoodixTls *self)
    v = sqrt (v / GOODIX_IMG_PIXELS);
    if (v < GOODIX_FINGER_STD / 3.0)
      {
@@ -1203,7 +1226,7 @@ index 8b41bcb..1be7044 100644
    return gx_sift_extract (img, GOODIX_IMG_WIDTH, GOODIX_IMG_HEIGHT);
  }
  
-@@ -1855,6 +2478,17 @@ gx_views_from_print (FpPrint *print)
+@@ -1855,6 +2494,17 @@ gx_views_from_print (FpPrint *print)
   * after an authenticated user, and no account is named like this. */
  #define GX_ADAPT_DIR "/var/lib/fprint/.goodixtls-adapt"
  
@@ -1221,11 +1244,21 @@ index 8b41bcb..1be7044 100644
  /* No view acquired for GX_ADAPT_REFRESH_S, judged on the store's mtime (every
   * append or rewrite touches it); an empty store is always due. */
  static gboolean
-@@ -1912,6 +2546,179 @@ gx_adapt_load (const gchar *path)
+@@ -1912,17 +2562,288 @@ gx_adapt_load (const gchar *path)
    return views;
  }
  
-+
+-/* Keeps only the most recent adapted views that fit under GX_MAX_VIEWS next to
+- * the enrolled ones. An older store can hold more (up to 20 next to a 30-view
+- * enrolment): they stay on disk, unused. */
+-static void
+-gx_adapt_cap (GPtrArray *extra, guint enrolled)
+-{
+-  guint room = enrolled < GX_MAX_VIEWS ? GX_MAX_VIEWS - enrolled : 0;
+ 
+-  if (extra->len > room)
+-    g_ptr_array_remove_range (extra, 0, extra->len - room);
+-}
 +/* --- pending candidates: new areas awaiting a second sighting ------------
 + *
 + * A verify that scores below the decision threshold is normally just a failed
@@ -1258,6 +1291,57 @@ index 8b41bcb..1be7044 100644
 +  return g_strdup_printf ("%.*s.pending",
 +                          (int) (strlen (adapt_path) - strlen (".views")),
 +                          adapt_path);
++}
++
++/* Which physical press each pending entry came from.
++ *
++ * Kept in a sidecar rather than in the .pending blob so that an older store,
++ * written before this existed, still loads: a missing sidecar simply means the
++ * generations are unknown, and unknown is treated as "different" - see
++ * gx_pending_consider. The alternative, extending the blob format, would have
++ * made every existing pending entry unreadable. */
++static gchar *
++gx_pending_gen_path (const gchar *ppath)
++{
++  return ppath ? g_strdup_printf ("%s.press", ppath) : NULL;
++}
++
++static GArray *
++gx_pending_generations (const gchar *ppath)
++{
++  GArray *a = g_array_new (FALSE, FALSE, sizeof (guint32));
++  g_autofree gchar *gp = gx_pending_gen_path (ppath);
++  g_autofree gchar *raw = NULL;
++  gsize len = 0, i;
++
++  if (!gp || !g_file_get_contents (gp, &raw, &len, NULL))
++    return a;
++  for (i = 0; i + 4 <= len; i += 4)
++    {
++      guint32 g;
++      memcpy (&g, raw + i, 4);
++      g_array_append_val (a, g);
++    }
++  return a;
++}
++
++static gboolean
++gx_pending_generations_save (const gchar *ppath, GArray *gens)
++{
++  g_autofree gchar *gp = gx_pending_gen_path (ppath);
++  g_autofree gchar *tmp = NULL;
++
++  if (!gp)
++    return FALSE;
++  tmp = g_strconcat (gp, ".tmp", NULL);
++  if (!g_file_set_contents (tmp, (const gchar *) gens->data,
++                            sizeof (guint32) * gens->len, NULL) ||
++      g_chmod (tmp, 0600) != 0 || g_rename (tmp, gp) != 0)
++    {
++      g_unlink (tmp);
++      return FALSE;
++    }
++  return TRUE;
 +}
 +
 +/* Loads pending views: same length-prefixed blob format as the adaptive
@@ -1323,13 +1407,18 @@ index 8b41bcb..1be7044 100644
 +/* Decides what to do with an unrecognised capture. Returns TRUE when the view
 + * was promoted into the adaptive store (the caller then logs it as acquired).
 + *
-+ * @novelty is the fraction of the capture the stored views do NOT explain. */
++ * @novelty is the fraction of the capture the stored views do NOT explain.
++ * @generation identifies the physical press this capture belongs to; see
++ * GxTask.press_continues. Two captures from the SAME generation are one press
++ * seen twice, which is not evidence that the area matters - only that the
++ * sensor was read twice. Such a pair is never promoted. */
 +static gboolean
 +gx_pending_consider (const gchar *apath, const GxSiftFeatures *probe,
-+                     double novelty)
++                     double novelty, guint generation)
 +{
 +  g_autofree gchar *ppath = gx_pending_path (apath);
 +  g_autoptr(GPtrArray) pend = NULL;
++  g_autoptr(GArray) gens = NULL;
 +  double best_overlap = 0;
 +  int best_idx = -1;
 +  guint i;
@@ -1347,6 +1436,7 @@ index 8b41bcb..1be7044 100644
 +    }
 +
 +  pend = gx_pending_load (ppath);
++  gens = gx_pending_generations (ppath);
 +
 +  /* Does this capture show the same area as an earlier pending one? */
 +  for (i = 0; i < pend->len; i++)
@@ -1370,9 +1460,36 @@ index 8b41bcb..1be7044 100644
 +
 +  if (best_idx >= 0 && best_overlap >= GX_DUPLICATE_FRAC)
 +    {
-+      /* Second sighting of the same uncovered area: promote it. */
++      /* The area matches a pending entry. Whether that counts as a second
++       * sighting depends on the press it came from.
++       *
++       * Same generation means the finger never left the pad: pam retried, or
++       * the caller asked again while it rested there. That is ONE press read
++       * twice, and promoting on it would let a single touch write itself into
++       * the biometric record - the exact thing the two-sighting rule exists to
++       * prevent. So the entry is refreshed rather than promoted, and the
++       * generation is updated to this one: a later, genuinely separate press
++       * still promotes it.
++       *
++       * Unknown (no sidecar, i.e. an older store) is treated as different, so
++       * behaviour does not change for existing pending entries. */
++      guint32 prev_gen = (guint) best_idx < gens->len
++                       ? g_array_index (gens, guint32, best_idx) : 0;
++
++      if (prev_gen != 0 && prev_gen == generation)
++        {
++          fp_info ("verify: same press seen again (%.0f%% agreement) - "
++                   "one press counts once, not promoting", best_overlap * 100.0);
++          return FALSE;
++        }
++
++      /* Second sighting of the same uncovered area, from a different press:
++       * promote it. */
 +      g_ptr_array_remove_index (pend, best_idx);
++      if ((guint) best_idx < gens->len)
++        g_array_remove_index (gens, best_idx);
 +      gx_pending_rewrite (ppath, pend);
++      gx_pending_generations_save (ppath, gens);
 +      fp_info ("verify: new area seen twice (%.0f%% agreement) - adding it "
 +               "to this finger's store", best_overlap * 100.0);
 +      return TRUE;
@@ -1388,20 +1505,45 @@ index 8b41bcb..1be7044 100644
 +    if (copy)
 +      {
 +        g_ptr_array_add (pend, copy);
++        while (gens->len < pend->len)
++          {
++            guint32 zero = 0;
++            g_array_append_val (gens, zero);
++          }
++        if (gens->len)
++          g_array_index (gens, guint32, gens->len - 1) = generation;
 +        while (pend->len > GX_PENDING_MAX)
-+          g_ptr_array_remove_index (pend, 0);
++          {
++            g_ptr_array_remove_index (pend, 0);
++            if (gens->len)
++              g_array_remove_index (gens, 0);
++          }
 +        if (gx_pending_rewrite (ppath, pend))
-+          fp_info ("verify: new area seen once (%.0f%% novel) - will add it if "
-+                   "it appears again", novelty * 100.0);
++          {
++            gx_pending_generations_save (ppath, gens);
++            fp_info ("verify: new area seen once (%.0f%% novel) - will add it if "
++                     "it appears again", novelty * 100.0);
++          }
 +      }
 +  }
 +  return FALSE;
 +}
 +
- /* Keeps only the most recent adapted views that fit under GX_MAX_VIEWS next to
-  * the enrolled ones. An older store can hold more (up to 20 next to a 30-view
-  * enrolment): they stay on disk, unused. */
-@@ -2079,11 +2886,16 @@ gx_adapt_clear (FpPrint *print)
++/* Keeps only the most recent adapted views that fit under GX_MAX_VIEWS next to
++ * the enrolled ones. An older store can hold more (up to 20 next to a 30-view
++ * enrolment): they stay on disk, unused. */
++static void
++gx_adapt_cap (GPtrArray *extra, guint enrolled)
++{
++  guint room = enrolled < GX_MAX_VIEWS ? GX_MAX_VIEWS - enrolled : 0;
++
++  if (extra->len > room)
++    g_ptr_array_remove_range (extra, 0, extra->len - room);
++}
+ 
+ static gboolean
+ gx_adapt_append (const gchar *path, const GxSiftFeatures *f)
+@@ -2079,11 +3000,16 @@ gx_adapt_clear (FpPrint *print)
  {
    g_autofree gchar *path = gx_adapt_path (print);
    g_autofree gchar *scores = gx_score_path (path);
@@ -1418,16 +1560,18 @@ index 8b41bcb..1be7044 100644
  }
  
  /* fprintd deletes the template itself and NEVER tells the driver: our prints
-@@ -2175,6 +2987,8 @@ typedef struct
+@@ -2175,6 +3101,10 @@ typedef struct
    gboolean        verifying;
    int             threshold; /* decision threshold for the template's size */
    GxSiftIsland   *island;  /* coverage accumulated, for enrolment guidance */
 +  guint           repeats; /* presses that duplicated an area already covered */
 +  gboolean        last_repeat; /* was the most recent press a duplicate? */
++  gboolean        press_continues; /* this verify began with no lift since the
++                                    * previous one: same physical press */
  } GxTask;
  
  enum {
-@@ -2281,8 +3095,10 @@ static void
+@@ -2281,8 +3211,10 @@ static void
  gx_finish_close (FpiDeviceGoodixTls *self)
  {
    gx_timing_session_end (self);
@@ -1438,7 +1582,105 @@ index 8b41bcb..1be7044 100644
    if (self->spi_fd >= 0)
      {
        close (self->spi_fd);
-@@ -2576,8 +3392,17 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+@@ -2324,6 +3256,7 @@ gx_session_done (GObject *src, GAsyncResult *res, gpointer user_data)
+                            fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+       return;
+     }
++
+   fpi_ssm_next_state (w->ssm);
+ }
+ 
+@@ -2395,26 +3328,56 @@ gx_poll_on (gpointer user_data)
+       fp_dbg ("wait-on: detection probe failed");
+       goto again;
+     }
+-
+   /* Reuse the values just read; probing twice per poll perturbs the sensor. */
+   if (t->polls % 5 == 0)
+     fp_info ("wait-on: mean=%d drop=%d (thresholds %d / %d)",
+              gx_fdt_mean (cur), gx_fdt_drop (self->fdt_base, cur),
+              self->fdt_abs, GOODIX_FDT_DROP);
+ 
+-  if (gx_fdt_drop (self->fdt_base, cur) > GOODIX_FDT_DROP ||
+-      gx_fdt_mean (cur) < self->fdt_abs)
+-    {
+-      /* Keep NEEDED asserted: the capture still takes about 1.1 s and the
+-       * finger must stay down for it. This flag is what lets a user interface
+-       * say when to lift — without it people lift on detection, one second too
+-       * early, and spoil the capture. */
+-      fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED |
+-                                       FP_FINGER_STATUS_PRESENT);
+-      self->poll_id = 0;
+-      fpi_ssm_jump_to_state (ssm, GX_ST_CAPTURE);
+-      return G_SOURCE_REMOVE;
+-    }
++  {
++    gboolean present = gx_fdt_drop (self->fdt_base, cur) > GOODIX_FDT_DROP ||
++                       gx_fdt_mean (cur) < self->fdt_abs;
++
++    /* Which physical press is this? Answered by the FIRST poll of the wait.
++     *
++     * A finger already present on that first poll was never lifted since the
++     * previous verification, so this is the same press and must not count as a
++     * second sighting. A clear first poll means the pad really was empty when
++     * the wait began, so whatever lands later is a new press.
++     *
++     * This is where the question can actually be answered. The session start
++     * cannot: right after the handshake the sensor still reports the previous
++     * press (measured 237-239 for a pad that had been clear for two seconds),
++     * and deciding on that merged three separate presses into one. Polling
++     * samples the pad for hundreds of milliseconds and reports it as it is. */
++    if (t->polls == 0 && t->verifying)
++      {
++        t->press_continues = present;
++        if (present)
++          fp_info ("verify: finger already down at the first poll - "
++                   "same press as before, generation %u",
++                   self->press_generation);
++        else
++          {
++            self->press_generation++;
++            fp_info ("verify: pad clear at the first poll - new press, "
++                     "generation %u", self->press_generation);
++          }
++      }
++
++    if (present)
++      {
++        /* Keep NEEDED asserted: the capture still takes about 1.1 s and the
++         * finger must stay down for it. This flag is what lets a user interface
++         * say when to lift — without it people lift on detection, one second too
++         * early, and spoil the capture. */
++        fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED |
++                                         FP_FINGER_STATUS_PRESENT);
++        self->poll_id = 0;
++        fpi_ssm_jump_to_state (ssm, GX_ST_CAPTURE);
++        return G_SOURCE_REMOVE;
++      }
++  }
+ again:
+   if (++t->polls > GX_POLL_MAX)
+     {
+@@ -2569,6 +3532,18 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+       fp_info ("verify: attempt %d -> %d matches (threshold %d)",
+                t->tries, t->best, t->threshold);
+ 
++      /* Deliberately NOT probing the finger here.
++       *
++       * At this point the capture has just finished, so the finger is by
++       * definition still on the pad - the probe would return TRUE every time,
++       * and the next verify would always be classified as a continuation. That
++       * would suppress the second sighting of every genuinely separate press,
++       * which is the opposite of the intent.
++       *
++       * The question "did the finger lift before the next verify?" cannot be
++       * answered at capture time. It is answered where it is asked: the next
++       * gx_dev_verify probes the sensor on entry if a previous press is
++       * recorded as possibly continuing. */
+     }
+   else
+     {
+@@ -2576,8 +3551,17 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
        guint np = 0;
        gboolean placed;
  
@@ -1457,7 +1699,7 @@ index 8b41bcb..1be7044 100644
  
        /* Register this view against the coverage acquired so far. The
         * result is logged rather than returned: enrol progress carries no
-@@ -2598,7 +3423,18 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
+@@ -2598,7 +3582,18 @@ gx_capture_done (GObject *src, GAsyncResult *res, gpointer user_data)
                   "extent=%dx%d points=%u (disjoint area)",
                   t->stage, sc, x1 - x0, y1 - y0, np);
  
@@ -1477,7 +1719,7 @@ index 8b41bcb..1be7044 100644
      }
    /* Capture done: we no longer need the finger, only its release.
     * PRESENT without NEEDED is the "you may lift now" signal. */
-@@ -2747,6 +3583,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
+@@ -2747,6 +3742,211 @@ gx_read_psk (FpiDeviceGoodixTls *self, const gchar *path, guint32 psk_addr)
    return FALSE;
  }
  
@@ -1689,7 +1931,15 @@ index 8b41bcb..1be7044 100644
  /* Picks the model from the ACPI id behind the spidev node:
   * /dev/spidev0.0 -> /sys/class/spidev/spidev0.0/device -> ../spi-GXFP51A7:00.
   * Falls back to the GXFP5187, whose path this driver was validated on. */
-@@ -2782,6 +3823,8 @@ gx_dev_open (FpDevice *dev)
+@@ -2779,9 +3979,16 @@ gx_dev_open (FpDevice *dev)
+   /* Drop stores whose fprintd template was deleted meanwhile. */
+   gx_adapt_sweep ();
+ 
++  /* A fresh open is a fresh conversation: whatever the finger was doing when
++   * the last one ended says nothing about now. Clearing these means the first
++   * verify after an open always starts a new press generation. */
++  self->adapt_generation = 0;
++
    path = fpi_device_get_udev_data (dev, FPI_DEVICE_UDEV_SUBTYPE_SPIDEV);
    self->model = gx_model_for (path);
    self->fdt_meas_ok = FALSE;
@@ -1698,7 +1948,7 @@ index 8b41bcb..1be7044 100644
    self->spi_fd = open (path, O_RDWR);
    if (self->spi_fd < 0)
      {
-@@ -2823,14 +3866,56 @@ gx_dev_open (FpDevice *dev)
+@@ -2823,14 +4030,56 @@ gx_dev_open (FpDevice *dev)
    if (self->timing_scale != 100)
      fp_info ("starting from learned timing scale %d%%", self->timing_scale);
  
@@ -1760,7 +2010,36 @@ index 8b41bcb..1be7044 100644
  
    fpi_device_open_complete (dev, NULL);
  }
-@@ -2898,6 +3983,31 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+@@ -2864,6 +4113,9 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+ 
+   if (error)
+     {
++      /* Nothing to clear: whether this is the same press is decided by the
++       * NEXT session, which measures the finger at open. A timeout here says
++       * nothing either way. */
+       if (error->domain == FP_DEVICE_RETRY)
+         fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, g_steal_pointer (&error));
+       fpi_device_verify_complete (dev, error);
+@@ -2871,6 +4123,8 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+     }
+   if (!t->probe)
+     {
++      /* No capture happened, so nothing was learned; the next session will
++       * measure the finger for itself. */
+       fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL,
+                                 fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+       fpi_device_verify_complete (dev, NULL);
+@@ -2884,6 +4138,9 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+     g_autofree gchar *apath = gx_adapt_path (template);
+     g_autoptr(GPtrArray) extra = gx_adapt_load (apath);
+     guint stored = extra->len;
++    /* The physical press this verify belongs to. Two verifications sharing a
++     * generation are one press read twice - see gx_dev_verify. */
++    guint gen = FPI_DEVICE_GOODIXTLS (dev)->press_generation;
+ 
+     gx_adapt_cap (extra, views->len);
+     fp_info ("verify: %d matches in %d attempt(s) "
+@@ -2898,18 +4155,55 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       * grows step by step without ever relaxing the safety constraint.
       * Above the upper bound a capture still enters once a day, so the store
       * keeps a recent view of a finger that otherwise scores too well. */
@@ -1775,7 +2054,7 @@ index 8b41bcb..1be7044 100644
 +      {
 +        double novelty = 1.0 - ((double) best / (double) t->probe->n);
 +
-+        if (gx_pending_consider (apath, t->probe, novelty) &&
++        if (gx_pending_consider (apath, t->probe, novelty, gen) &&
 +            views->len < GX_MAX_VIEWS)
 +          {
 +            guint room = GX_MAX_VIEWS - views->len;
@@ -1789,10 +2068,73 @@ index 8b41bcb..1be7044 100644
 +          }
 +      }
 +
++    /* Adaptive store, same rule as the pending store: one physical press adds
++     * one view. While the finger rests on the pad, pam's retries each reach
++     * this code with a fresh capture, and appending each one would fill the
++     * store with N near-identical views of a single press - crowding out the
++     * genuinely different areas the store is for, and inflating the template
++     * with duplicates that the deduplication in merge_points then has to
++     * fight. The generation check makes the second and later sightings of the
++     * same press no-ops. */
      if (best >= GX_ADAPT_MIN (t->threshold) &&
          (best <= (int) (GX_ADAPT_MAX_FRAC * t->probe->n) ||
           gx_adapt_due (apath)) &&
-@@ -2987,6 +4097,7 @@ static void
+-        views->len < GX_MAX_VIEWS)
++        views->len < GX_MAX_VIEWS &&
++        FPI_DEVICE_GOODIXTLS (dev)->adapt_generation != gen)
+       {
+         guint room = GX_MAX_VIEWS - views->len;
+ 
+         if (stored < room)
+           {
+             if (gx_adapt_append (apath, t->probe))
+-              fp_info ("adaptive store: view acquired (%u/%u)", stored + 1,
+-                       room);
++              {
++                FPI_DEVICE_GOODIXTLS (dev)->adapt_generation = gen;
++                fp_info ("adaptive store: view acquired (%u/%u)", stored + 1,
++                         room);
++              }
+           }
+         else
+           {
+@@ -2926,12 +4220,21 @@ gx_verify_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+                 g_ptr_array_remove_index (extra, 0);
+                 g_ptr_array_add (extra, copy);
+                 if (gx_adapt_rewrite (apath, extra))
+-                  fp_info ("adaptive store: oldest view replaced (%u/%u)",
+-                           extra->len, room);
++                  {
++                    FPI_DEVICE_GOODIXTLS (dev)->adapt_generation = gen;
++                    fp_info ("adaptive store: oldest view replaced (%u/%u)",
++                             extra->len, room);
++                  }
+               }
+           }
+       }
+-    gx_score_record (apath, best, t->threshold);
++    /* One press contributes one score. A finger held on the pad through pam's
++     * retries produces several verifications, and recording each would let a
++     * single bad placement look like a template-wide decline: the degradation
++     * check takes the median of the last eight, so eight retries of one press
++     * would fill the window on their own. */
++    if (!t->press_continues)
++      gx_score_record (apath, best, t->threshold);
+   }
+   fpi_device_verify_report (dev,
+                             best >= t->threshold ? FPI_MATCH_SUCCESS :
+@@ -2976,6 +4279,10 @@ gx_dev_verify (FpDevice *dev)
+   FpiSsm *ssm = fpi_ssm_new (dev, gx_run_state, GX_ST_NUM);
+   GxTask *t = g_new0 (GxTask, 1);
+ 
++  /* press_continues cannot be decided here: the sensor is not open and the
++   * detection baseline does not exist yet. It is set in gx_session_done, from
++   * the measurement gx_session_start makes when it opens with a finger already
++   * on the pad. */
+   t->verifying = TRUE;
+   fpi_ssm_set_data (ssm, t, (GDestroyNotify) gx_task_free);
+   fpi_ssm_start (ssm, gx_verify_done);
+@@ -2987,6 +4294,7 @@ static void
  fpi_device_goodixtls_init (FpiDeviceGoodixTls *self)
  {
    self->spi_fd = -1;
@@ -1800,7 +2142,7 @@ index 8b41bcb..1be7044 100644
  }
  
  static void
-@@ -2996,6 +4107,7 @@ fpi_device_goodixtls_finalize (GObject *object)
+@@ -2996,6 +4304,7 @@ fpi_device_goodixtls_finalize (GObject *object)
  
    if (self->spi_fd >= 0)
      close (self->spi_fd);

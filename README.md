@@ -201,6 +201,25 @@ Such a capture goes to a `.pending` store rather than the template. Only when th
 same area appears again is it added — one stray press cannot write itself into
 the biometric record.
 
+**A press held down counts once, not once per read.** `pam_fprintd` retries up
+to `max-tries` times, and every retry is a separate verify: a new TLS session, a
+new capture, a new decision. A finger left resting on the pad through those
+retries would otherwise look like several independent confirmations of the same
+area and promote it after a single touch.
+
+The press is identified by a generation number, bumped only when the pad is
+clear at the first detection poll of a verify. A clear pad means the finger
+lifted, so what follows is a new press; a finger already present means it never
+left, so the generation is unchanged and repeats within it are not counted as
+evidence. The same rule gates the adaptive store (one press adds one view) and
+the score history (one press records one score, so a single bad placement cannot
+fill the degradation window on its own).
+
+The first poll is the right place to decide this, and the session start is not:
+right after the handshake the sensor still reports the previous press — measured
+237–239 for a pad that had been clear for two seconds — and deciding on that
+merged three separate presses into one.
+
 Measured separation for the 0.33 boundary (content correlation → fraction
 already covered):
 

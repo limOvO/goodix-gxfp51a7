@@ -50,7 +50,18 @@ on_verify_done (FpDevice *dev, GAsyncResult *res, gpointer u)
   g_clear_object (&out);
 
   if (--remaining > 0)
-    start_verify (dev);
+    {
+      /* Optional pause between attempts, so a person can lift a finger and
+       * press again. Without it the next verify starts 0.4 s after the previous
+       * one and the sensor still reads the same finger, which makes every
+       * attempt look like the same press - correct behaviour, useless test.
+       * Set GX_VERIFY_DELAY_MS to a few seconds to exercise separate presses. */
+      const char *d = g_getenv ("GX_VERIFY_DELAY_MS");
+      if (d && atoi (d) > 0)
+        g_timeout_add ((guint) atoi (d), (GSourceFunc) start_verify, dev);
+      else
+        start_verify (dev);
+    }
   else
     g_main_loop_quit (loop);
 }
