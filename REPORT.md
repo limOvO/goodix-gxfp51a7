@@ -488,7 +488,61 @@ not for a pressed finger. This is close to the floor for this part.
 
 ---
 
-## 11. An upstream TLS bug found on the way
+## 11. Optimising the dominant cost: the reply-ready interrupt
+
+74% of the latency was the capture sequence, and the largest single component
+was that the driver **guessed** when a reply had arrived: a fixed 15 ms sleep
+after each command, then polling. The vendor driver does not guess — the sensor
+raises GPIO 48 when a reply is staged, and the public protocol notes document
+it.
+
+`diagnostics/irq-probe.c` verified the line on this hardware before any driver
+change: it asserted on **8/8** exchanges, and an IRQ-driven round trip took
+**5.8 ms against 35 ms** for the timed approach.
+
+The driver now waits on that line for reply-ready. Measured effect:
+
+| | before | after |
+|---|---|---|
+| cmd 0xae | 82 ms | 67 ms |
+| cmd 0x36 | 92 ms | 78 ms |
+| cmd 0x50 | 106 ms | 92 ms |
+| cmd 0x20 | 77 ms | 62 ms |
+| **capture sequence** | **607 ms** | **524 ms** |
+| press → verdict | 820 ms | 737 ms |
+| touch → verdict (incl. poll) | ~1092 ms | ~1009 ms |
+
+83 ms off every recognition, **14%** of the sequence, verified 5/5 captures
+with no failures.
+
+### What was tried and reverted
+
+Also using the line to decide when the reply was *finished* — replacing the
+drain's four 10 ms silence misses — broke capture outright: **0/5 frames**, and
+the sequence grew past a second as the bus fell progressively further out of
+step.
+
+The reason is worth recording, because it looks like an obvious optimisation:
+a 3 ms quiet window is far shorter than the sensor's own inter-frame gap, so
+the drain returned while the sensor was still emitting, and the next command
+collided with a reply still in flight. The timed misses are not a slower
+substitute for the line — they measure **silence**, which is what the protocol
+actually requires before the next command may be sent. The line answers "has the
+reply started", not "is it over".
+
+The reverted version was removed rather than left behind a flag, and the code
+carries the reasoning so it is not retried.
+
+### It stays optional
+
+Some boards may not wire GPIO 48, and another process may hold it. If the line
+cannot be claimed the driver says so and falls back to the timed path, which is
+the behaviour everything was validated with. `GOODIXTLS_NO_IRQ=1` forces the
+fallback for comparison; verified it still captures (599 ms, image received).
+
+---
+
+## 12. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -517,7 +571,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 12. Verification
+## 13. Verification
 
 Repeated, measured, on the final build:
 
@@ -544,7 +598,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 13. Remaining work
+## 14. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -567,7 +621,7 @@ password always remains available as a fallback.
 
 ---
 
-## 14. Security notes
+## 15. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -583,7 +637,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 15. Provenance
+## 16. Provenance
 
 Reverse-engineering input, all public:
 

@@ -215,24 +215,41 @@ could never fire.)
 
 ## Latency
 
-Measured from the driver's own timestamps, median over 4 presses — see
-`diagnostics/fingerprint-latency.py`:
+Measured from the driver's own timestamps (`diagnostics/fingerprint-latency.py`):
 
 | phase | time | share |
 |---|---|---|
-| capture sequence (5 protocol commands) | 607 ms | 74% |
-| image reception + TLS decryption | 124 ms | 15% |
+| capture sequence (5 protocol commands) | 524 ms | 71% |
+| image reception + TLS decryption | 124 ms | 17% |
 | descriptor matching + decision | 89 ms | 11% |
-| **press → verdict** | **820 ms** | |
+| **press → verdict** | **737 ms** | |
 
 Plus the detection poll: the driver only notices a press on its next finger
 probe, ~545 ms apart, so add 0–545 ms (avg ~272 ms).
 
-**Typical touch-to-verdict: ~1.1 s.**
+**Typical touch-to-verdict: ~1.0 s.**
 
-Worth knowing: the matching is only 89 ms — the software side is not the
-bottleneck. Three quarters is the protocol exchange, and those delays are
-load-bearing (drain 2 wedges the sensor outright).
+### The reply-ready interrupt
+
+The sensor raises GPIO 48 when a reply is staged; the driver waits on it rather
+than sleeping a fixed 15 ms and hoping. Verified on this hardware first: the line
+asserted 8/8, and an IRQ-driven exchange took 5.8 ms against 35 ms timed. Effect:
+
+| | before | after |
+|---|---|---|
+| capture sequence | 607 ms | **524 ms** |
+| press → verdict | 820 ms | **737 ms** |
+
+83 ms per recognition, 14%, 5/5 captures with no failures.
+
+**What does not work here:** also using the line to decide the reply has
+*finished*. A 3 ms quiet window is shorter than the sensor's inter-frame gap, so
+the drain returns mid-reply and the next command collides with it — 0/5 frames.
+The timed misses measure silence, which is what the protocol requires; the line
+answers "has it started", not "is it over".
+
+The line is optional. If it cannot be claimed, the driver falls back to the
+timed path. `GOODIXTLS_NO_IRQ=1` forces the fallback.
 
 ## If recognition gets worse after a driver change
 
