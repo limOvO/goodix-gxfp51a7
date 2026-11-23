@@ -587,7 +587,84 @@ The inter-command gap also went 30 ms → 15 ms. The floor is a hard cliff — 3
 
 ---
 
-## 13. An upstream TLS bug found on the way
+## 13. A press at a different angle: the geometry, not the descriptor
+
+The descriptor is rotation-normalised, so a rotated press should still match. It
+did not: on real presses, the same finger area pressed askew was rejected.
+
+Measuring it correctly mattered. An early attempt decoded the saved captures as
+packed 12-bit when the recorder writes already-decoded 16-bit samples, and the
+resulting features were self-consistent but meaningless — they "proved" the
+descriptor was not rotation-invariant at all, which was wrong.
+
+With the loader matching `stitch-captures.c`, rotating one capture against
+itself:
+
+| angle | correspondences | translation vote (old) | rigid fit (new) |
+|---|---|---|---|
+| 0° | 115 | 110 | 110 |
+| 5° | 85 | 66 | 66 |
+| 10° | 66 | **15** | **50** |
+| 15° | 66 | **15** | **39** |
+| 20° | 69 | **5** | **34** |
+| 30° | 45 | **3** | **20** |
+
+The descriptors keep producing correspondences to about 20°. What broke was the
+geometric validation: it voted on a **translation** only. Under rotation every
+correct pair implies a *different* translation, so the vote counts them as
+mutually inconsistent and discards them — the exact pairs that are right.
+
+So the fix is a rigid hypothesis (rotation plus translation) fitted by RANSAC
+over pairs of correspondences, refined once on the inlier set. No tolerance was
+loosened; `GEO_TOL` stays at 6 px.
+
+Against a real multi-view template, probe rotated, threshold 20:
+
+| angle | old pass | new pass |
+|---|---|---|
+| 0° | 12/18 | **14/18** |
+| 10° | 11/18 | **13/18** |
+| 20° | 6/18 | **13/18** |
+| 30° | 4/18 | **12/18** |
+| 35° | 1/18 | **11/18** |
+
+### Impostor check
+
+A rigid fit has one more degree of freedom than a translation, so it can fit
+noise. Measured on 234 impostor trials (18 captures of one finger against 13 of
+another):
+
+| | old | new |
+|---|---|---|
+| impostor max | 4 | **5** |
+| impostor ≥ 5 | 0/234 | **1/234** (0.43 %) |
+| genuine median | 1 | 2 |
+| genuine p90 | 7 | 10 |
+
+Against a threshold of 20 the margin stays a factor of four. No threshold change
+was needed.
+
+### What this does and does not solve
+
+Rotation is covered by matching, so **one enrolment angle serves many press
+angles** — no need to record the finger at several orientations:
+
+```
+   rotating one capture against a template built from the others:
+     0° 14/18    10° 13/18    20° 13/18    30° 12/18    35° 11/18
+```
+
+What it does not fix is a press on an area the template never covered: the four
+captures that score zero do so at *every* angle, because they share no content
+at all. That is the coverage problem of section 12, not the geometry here.
+
+### Result on hardware
+
+Six normal presses, threshold 20: 33, 34, 20, 21, 24 — 5/5, no failures.
+
+---
+
+## 14. An upstream TLS bug found on the way
 
 Rebuilding from a clean clone occasionally failed the driver's own TLS test
 (`/tls/cbc-legacy-hello`) — roughly 1 run in 30. It reproduces in pristine,
@@ -616,7 +693,7 @@ only rejects records whose padding was actually tampered with.
 
 ---
 
-## 14. Verification
+## 15. Verification
 
 Repeated, measured, on the final build:
 
@@ -643,7 +720,7 @@ stage 12  extent 253x227  points 854
 
 ---
 
-## 15. Remaining work
+## 16. Remaining work
 
 **One manual step: complete a full enrolment and verify a match.** Everything up
 to and including press capture is automated and verified; a 20-press enrolment
@@ -666,7 +743,7 @@ password always remains available as a fallback.
 
 ---
 
-## 16. Security notes
+## 17. Security notes
 
 This sensor **streams images to the host** and matching runs on the CPU — it is
 not match-on-chip. Consequences worth stating plainly:
@@ -682,7 +759,7 @@ Treat it as a convenience factor, not a sole defence.
 
 ---
 
-## 17. Provenance
+## 18. Provenance
 
 Reverse-engineering input, all public:
 

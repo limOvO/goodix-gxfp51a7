@@ -158,28 +158,32 @@ rather than assumed: `SPI_CS_HIGH` (this unit runs plain `SPI_MODE_0`) and the
 A 0xD0 reply means the sensor wants a fresh TLS session; the driver reconnects
 and retries once instead of failing.
 
-## Why some press angles fail
+## When a press still fails
 
-Measured on six presses of one enrolled finger, deliberately varying the angle:
+Two different causes were being confused here, and an earlier version of this
+section blamed the wrong one.
 
-```
-44  56  25  0  31  5        (threshold 20)
-```
+**Not enough finger on the pad.** Measured on six presses of an enrolled
+finger:
 
-Bimodal — 25-56 or 0-5, never a near miss. That is not template coverage. The
-captures say it plainly:
+| result | active pixels |
+|---|---|
+| matches (37, 23) | 13362-14292 |
+| fails (3, 7) | 5062-5172 |
 
-| result | active pixels | finger signal |
-|---|---|---|
-| matches (37, 23) | 13362-14292 | full press |
-| fails (3, 7) | 5062-5172 | **a third of the finger** |
+A failing press carried a third of the finger. When the pad sits under the edge
+of the fingertip rather than its centre, there is nothing to match and no code
+change helps — press with the pad under the middle of the fingertip.
 
-Rotation was tested rather than assumed: rotating a failing capture through
-+-30 deg and re-scoring changes nothing (best angle always 0 deg, 4 -> 4,
-19 -> 19), so the descriptors are already rotation-invariant.
+**Angle.** This one *was* fixable, and the earlier claim that it was not came
+from a botched measurement — see [Pressing at an angle](#pressing-at-an-angle)
+for the corrected numbers and the fix. Short version: the descriptors were
+rotation-invariant all along; the geometric check that filtered their matches
+was not.
 
-A failing press is not centred on the pad. There is no code fix for a third of
-a fingerprint — press with the pad under the centre of the fingertip.
+A press on an area the template never covered also scores zero, at every angle,
+because the two images share no content. That is the coverage limit, not the
+geometry.
 
 ## Growing the template during normal use
 
@@ -253,6 +257,49 @@ degrading, so the values sit back from the cliff.
 A short quiet window is shorter than the sensor's inter-frame gap, the drain
 returns mid-reply, and the next command collides with it — 0/5 frames. The
 timed misses measure silence, which is what the protocol requires.
+
+## Pressing at an angle
+
+Pressing the same area at a different angle used to fail. The descriptors were
+fine — they are rotation-normalised — but the geometric check that filters out
+false matches voted on **translation only**. Under a rotation every correct pair
+implies a different translation, so the vote discarded exactly the pairs that
+were right.
+
+The check now fits a rigid transform (rotation plus translation) by RANSAC. No
+tolerance was loosened.
+
+```
+  one capture rotated, scored against itself     threshold 20 applies to real
+     angle   before   after                        presses, not to this bench
+       0°      110     110
+      10°       15      50
+      20°        5      34
+      30°        3      20
+```
+
+Against a template built from other presses, how often a rotated probe still
+passes:
+
+| rotation | before | after |
+|---|---|---|
+| 0° | 12/18 | **14/18** |
+| 10° | 11/18 | **13/18** |
+| 20° | 6/18 | **13/18** |
+| 30° | 4/18 | **12/18** |
+| 35° | 1/18 | **11/18** |
+
+Two consequences worth knowing:
+
+* **One enrolment angle is enough.** Rotation is matched, not memorised, so you
+  do not need to enrol the finger at several orientations.
+* **An uncovered area still fails.** A press on a region the template never saw
+  scores zero at every angle, because the images share no content. That is a
+  coverage limit, not a matching one.
+
+Impostor scores were re-measured (234 trials, one finger against another): max
+5 against a threshold of 20, from 4 before. Genuine median 1 → 2. No threshold
+change was needed.
 
 ## If recognition gets worse after a driver change
 

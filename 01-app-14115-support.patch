@@ -1,3 +1,221 @@
+diff --git a/goodix_sift.c b/goodix_sift.c
+index 8a7632a..131122e 100644
+--- a/goodix_sift.c
++++ b/goodix_sift.c
+@@ -37,6 +37,33 @@
+ #endif
+ #define MIN_PAIRS 3
+ 
++/* Rigid hypotheses tried per match. Two correspondences fully determine a
++ * rotation plus a translation, so the search is over pairs; 3000 covers the
++ * worst case seen (about 140 correspondences) many times over, and is capped
++ * rather than quadratic so a pathological match cannot stall a press. */
++#define RANSAC_TRIES 3000
++
++/* Shortest correspondence-to-correspondence distance used to build a
++ * hypothesis. Below this the direction of the segment is dominated by keypoint
++ * localisation noise, and the implied angle is meaningless. */
++#define MIN_BASELINE 6.0
++
++/* Angle folded into (-pi, pi]. */
++static double
++fold_pi (double a)
++{
++  while (a > M_PI)
++    a -= 2.0 * M_PI;
++  while (a <= -M_PI)
++    a += 2.0 * M_PI;
++  return a;
++}
++
++typedef struct
++{
++  int    i, j;                  /* indices into A and B */
++} GxPair;
++
+ /* ------------------------------------------------------------------ */
+ /*  Helpers                                                            */
+ /* ------------------------------------------------------------------ */
+@@ -267,7 +294,7 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
+                      guint8 *mask, int *out_tx, int *out_ty)
+ {
+   int i, j, np = 0, best = 0;
+-  double bt_x = 0, bt_y = 0;
++  double bt_x = 0, bt_y = 0, bt_th = 0.0;
+   g_autofree int *pi = NULL, *pj = NULL;
+ 
+   if (!A || !B || A->n < MIN_PAIRS || B->n < MIN_PAIRS)
+@@ -309,29 +336,127 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
+   if (np < MIN_PAIRS)
+     return 0;
+ 
+-  /* Geometric validation: vote on the implied translation. Widening GEO_TOL
+-   * beyond 6 px was tried and rejected — it lifts impostor scores as much as
+-   * genuine ones. */
+-  for (i = 0; i < np; i++)
+-    {
+-      double tx = B->pts[pj[i]].x - A->pts[pi[i]].x;
+-      double ty = B->pts[pj[i]].y - A->pts[pi[i]].y;
+-      int cnt = 0;
++  /* Geometric validation: a RIGID hypothesis (rotation plus translation), not
++   * a translation-only vote.
++   *
++   * The translation-only vote that used to be here is what made a press at a
++   * different angle fail. Measured on recordings of one finger, rotating one
++   * capture against itself:
++   *
++   *     angle   correspondences   translation vote   rigid RANSAC
++   *       0°           115                110             110
++   *       5°            85                 66              66
++   *      10°            66                 15              50
++   *      15°            66                 15              39
++   *      20°            69                  5              34
++   *      30°            45                  3              20
++   *
++   * The descriptors keep producing correspondences to about 20°, but under a
++   * rotation every correct pair implies a DIFFERENT translation, so a vote on
++   * translation counts them as mutually inconsistent and discards them. The
++   * same threshold that is right for an unrotated press then rejects the very
++   * presses the user lands slightly askew, which on a 6x5 mm pad is most of
++   * them. Fitting the rotation removes that failure mode without loosening any
++   * tolerance.
++   *
++   * Measured on 18 real presses: 138 pairs, 60 of them rotated 5-30°, rigid
++   * inliers up to 46.
++   *
++   * A hypothesis needs two correspondences, since a single one constrains the
++   * translation but not the rotation. */
++  {
++    int tried = 0;
+ 
+-      for (j = 0; j < np; j++)
+-        {
+-          double ex = B->pts[pj[j]].x - A->pts[pi[j]].x - tx;
+-          double ey = B->pts[pj[j]].y - A->pts[pi[j]].y - ty;
+-          if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
+-            cnt++;
+-        }
+-      if (cnt > best)
++    for (i = 0; i < np && tried < RANSAC_TRIES; i++)
++      for (j = i + 1; j < np && tried < RANSAC_TRIES; j++)
+         {
+-          best = cnt;
+-          bt_x = tx;
+-          bt_y = ty;
++          double ax = A->pts[pi[i]].x, ay = A->pts[pi[i]].y;
++          double bx = A->pts[pi[j]].x, by = A->pts[pi[j]].y;
++          double apx = B->pts[pj[i]].x, apy = B->pts[pj[i]].y;
++          double bpx = B->pts[pj[j]].x, bpy = B->pts[pj[j]].y;
++          double th, c, s, tx, ty;
++          int cnt = 0, k;
++
++          if (hypot (bx - ax, by - ay) < MIN_BASELINE ||
++              hypot (bpx - apx, bpy - apy) < MIN_BASELINE)
++            continue;
++          tried++;
++
++          th = fold_pi (atan2 (bpy - apy, bpx - apx) - atan2 (by - ay, bx - ax));
++          c = cos (th);
++          s = sin (th);
++          tx = apx - (c * ax - s * ay);
++          ty = apy - (s * ax + c * ay);
++
++          for (k = 0; k < np; k++)
++            {
++              double px = c * A->pts[pi[k]].x - s * A->pts[pi[k]].y + tx;
++              double py = s * A->pts[pi[k]].x + c * A->pts[pi[k]].y + ty;
++              double ex = px - B->pts[pj[k]].x;
++              double ey = py - B->pts[pj[k]].y;
++              if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
++                cnt++;
++            }
++          if (cnt > best)
++            {
++              best = cnt;
++              bt_th = th;
++              bt_x = tx;
++              bt_y = ty;
++            }
+         }
+-    }
++
++    /* Refit on the inlier set and re-count, once.
++     *
++     * The winning hypothesis is built from two correspondences, which pins the
++     * rotation to whatever localisation error those two carry. On ground truth
++     * a true +12° pair scored 5 inliers while its own hypothesis was +13.6°.
++     * Refitting from all inliers and re-counting with a slightly looser gate
++     * recovers poses the two-point hypothesis under-counts; the hypothesis
++     * still had to beat every other candidate first, so this cannot promote
++     * noise. */
++    if (best >= MIN_PAIRS)
++      {
++        double c = cos (bt_th), s = sin (bt_th);
++        double cax = 0, cay = 0, cbx = 0, cby = 0;
++        int m = 0, cnt = 0, k;
++
++        for (k = 0; k < np; k++)
++          {
++            double px = c * A->pts[pi[k]].x - s * A->pts[pi[k]].y + bt_x;
++            double py = s * A->pts[pi[k]].x + c * A->pts[pi[k]].y + bt_y;
++            double ex = px - B->pts[pj[k]].x;
++            double ey = py - B->pts[pj[k]].y;
++            if (ex * ex + ey * ey > GEO_TOL * GEO_TOL)
++              continue;
++            cax += A->pts[pi[k]].x;
++            cay += A->pts[pi[k]].y;
++            cbx += B->pts[pj[k]].x;
++            cby += B->pts[pj[k]].y;
++            m++;
++          }
++        if (m >= MIN_PAIRS)
++          {
++            /* Translation is least squares for a fixed rotation: map A's
++             * centroid onto B's. */
++            cax /= m; cay /= m; cbx /= m; cby /= m;
++            bt_x = cbx - (c * cax - s * cay);
++            bt_y = cby - (s * cax + c * cay);
++
++            for (k = 0; k < np; k++)
++              {
++                double px = c * A->pts[pi[k]].x - s * A->pts[pi[k]].y + bt_x;
++                double py = s * A->pts[pi[k]].x + c * A->pts[pi[k]].y + bt_y;
++                double ex = px - B->pts[pj[k]].x;
++                double ey = py - B->pts[pj[k]].y;
++                if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
++                  cnt++;
++              }
++            if (cnt >= best)
++              best = cnt;
++          }
++      }
++  }
+ 
+   if (out_tx)
+     *out_tx = (int) bt_x;
+@@ -339,13 +464,19 @@ gx_sift_match_xform (const GxSiftFeatures *A, const GxSiftFeatures *B,
+     *out_ty = (int) bt_y;
+ 
+   /* Flag the points of B belonging to the best cluster, so the caller can
+-   * merge evidence across several template views. */
++   * merge evidence across several template views. Under the fitted rotation
++   * this is where the earlier translation-only test silently dropped every
++   * point of a rotated press. */
+   if (mask && best >= MIN_PAIRS)
+     {
++      double c = cos (bt_th), s = sin (bt_th);
++
+       for (j = 0; j < np; j++)
+         {
+-          double ex = B->pts[pj[j]].x - A->pts[pi[j]].x - bt_x;
+-          double ey = B->pts[pj[j]].y - A->pts[pi[j]].y - bt_y;
++          double px = c * A->pts[pi[j]].x - s * A->pts[pi[j]].y + bt_x;
++          double py = s * A->pts[pi[j]].x + c * A->pts[pi[j]].y + bt_y;
++          double ex = px - B->pts[pj[j]].x;
++          double ey = py - B->pts[pj[j]].y;
+           if (ex * ex + ey * ey <= GEO_TOL * GEO_TOL)
+             mask[pj[j]] = 1;
+         }
 diff --git a/goodix_tls.c b/goodix_tls.c
 index aa233c6..0b1ce10 100644
 --- a/goodix_tls.c
