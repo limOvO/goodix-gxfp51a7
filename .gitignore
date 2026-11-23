@@ -23,3 +23,18 @@ __pycache__/
 
 # Local state
 *.log
+
+# NEVER commit biometric data or capture output.
+# A stitched fingerprint image was committed once by accident. These patterns
+# are the guard against a repeat: capture dumps, background frames, adaptive
+# stores, score history and any rendered image are all refused.
+*.png
+*.bin
+*.bg
+*.pending
+*.views
+*.scores
+# config_pcap.bin is a protocol constant from upstream, not biometric data
+!config_pcap.bin
+# documentation screenshots, if any are ever added
+!docs/**/*.png
